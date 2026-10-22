@@ -1,0 +1,630 @@
+"""Generate sample USD files for the web viewer.
+
+Requires Pixar's USD Python bindings and Pillow:
+    pip install usd-core pillow
+    python scripts/generate_samples.py public/samples
+"""
+
+import math
+import os
+import random
+import sys
+
+from PIL import Image, ImageDraw, ImageFilter
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdShade, UsdSkel, UsdUtils, Vt
+
+OUT = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "public/samples")
+
+
+# ---------------------------------------------------------------- textures
+
+
+def write_checker(path, size=256, cells=8, a=(235, 235, 235), b=(60, 64, 72)):
+    img = Image.new("RGB", (size, size))
+    draw = ImageDraw.Draw(img)
+    step = size // cells
+    for y in range(cells):
+        for x in range(cells):
+            draw.rectangle([x * step, y * step, (x + 1) * step - 1, (y + 1) * step - 1], fill=a if (x + y) % 2 == 0 else b)
+    img.save(path)
+
+
+def write_wood(path, size=256, seed=7):
+    rng = random.Random(seed)
+    img = Image.new("RGB", (size, size))
+    px = img.load()
+    phases = [rng.uniform(0, math.tau) for _ in range(4)]
+    for y in range(size):
+        for x in range(size):
+            u, v = x / size, y / size
+            ring = math.sin((u * 18 + 0.6 * math.sin(v * 6 + phases[0]) + 0.25 * math.sin(v * 23 + phases[1])) * math.pi)
+            t = 0.5 + 0.5 * ring
+            t = t ** 2.2
+            r = int(150 + 60 * t)
+            g = int(95 + 45 * t)
+            b = int(55 + 25 * t)
+            px[x, y] = (r, g, b)
+    img.filter(ImageFilter.GaussianBlur(0.6)).save(path)
+
+
+def write_stripes(path, size=256):
+    img = Image.new("RGB", (size, size), (238, 232, 220))
+    draw = ImageDraw.Draw(img)
+    for i in range(0, size, 32):
+        draw.rectangle([0, i, size, i + 10], fill=(32, 78, 140))
+        draw.rectangle([0, i + 14, size, i + 16], fill=(196, 120, 52))
+    img.save(path)
+
+
+def write_tiles(path, size=256, n=4):
+    img = Image.new("RGB", (size, size), (70, 70, 74))
+    draw = ImageDraw.Draw(img)
+    step = size // n
+    rng = random.Random(3)
+    for y in range(n):
+        for x in range(n):
+            c = 200 + rng.randint(-14, 14)
+            draw.rectangle([x * step + 2, y * step + 2, (x + 1) * step - 3, (y + 1) * step - 3], fill=(c, c - 6, c - 14))
+    img.save(path)
+
+
+# ---------------------------------------------------------------- helpers
+
+
+def make_material(stage, path, color=(0.8, 0.8, 0.8), metallic=0.0, roughness=0.5, texture=None, opacity=1.0, emissive=None):
+    mat = UsdShade.Material.Define(stage, path)
+    shader = UsdShade.Shader.Define(stage, path + "/PreviewSurface")
+    shader.CreateIdAttr("UsdPreviewSurface")
+    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(metallic)
+    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(roughness)
+    if opacity < 1.0:
+        shader.CreateInput("opacity", Sdf.ValueTypeNames.Float).Set(opacity)
+    if emissive:
+        shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*emissive))
+    if texture:
+        reader = UsdShade.Shader.Define(stage, path + "/STReader")
+        reader.CreateIdAttr("UsdPrimvarReader_float2")
+        reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+        tex = UsdShade.Shader.Define(stage, path + "/DiffuseTexture")
+        tex.CreateIdAttr("UsdUVTexture")
+        tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(texture)
+        tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(reader.ConnectableAPI(), "result")
+        tex.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("repeat")
+        tex.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("repeat")
+        tex.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("sRGB")
+        tex.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(tex.ConnectableAPI(), "rgb")
+    else:
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*color))
+    mat.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+    return mat
+
+
+def bind(prim, mat):
+    UsdShade.MaterialBindingAPI.Apply(prim.GetPrim() if hasattr(prim, "GetPrim") else prim).Bind(mat)
+
+
+def quad_plane(stage, path, size, uv_repeat, up="Y"):
+    mesh = UsdGeom.Mesh.Define(stage, path)
+    h = size / 2
+    if up == "Y":
+        pts = [(-h, 0, h), (h, 0, h), (h, 0, -h), (-h, 0, -h)]
+        n = (0, 1, 0)
+    else:
+        pts = [(-h, -h, 0), (h, -h, 0), (h, h, 0), (-h, h, 0)]
+        n = (0, 0, 1)
+    mesh.CreatePointsAttr(pts)
+    mesh.CreateFaceVertexCountsAttr([4])
+    mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
+    mesh.CreateNormalsAttr([n] * 4)
+    mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
+    mesh.CreateExtentAttr([(-h, 0, -h), (h, 0, h)] if up == "Y" else [(-h, -h, 0), (h, h, 0)])
+    st = UsdGeom.PrimvarsAPI(mesh).CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex)
+    st.Set([(0, 0), (uv_repeat, 0), (uv_repeat, uv_repeat), (0, uv_repeat)])
+    mesh.CreateSubdivisionSchemeAttr("none")
+    return mesh
+
+
+def lathe(stage, path, profile, segments=48, up="Y", uv_v_scale=1.0):
+    """Surface of revolution. profile = list of strips; each strip is a list of (radius, height)."""
+    mesh = UsdGeom.Mesh.Define(stage, path)
+    points, normals, st, counts, indices = [], [], [], [], []
+    ring_rows = []  # (row_index_start, strip_id)
+    v_acc = 0.0
+    for strip in profile:
+        rows = []
+        for i, (r, h) in enumerate(strip):
+            prev = strip[max(i - 1, 0)]
+            nxt = strip[min(i + 1, len(strip) - 1)]
+            dr, dh = nxt[0] - prev[0], nxt[1] - prev[1]
+            ln = math.hypot(dr, dh) or 1.0
+            nr, nh = dh / ln, -dr / ln
+            if i > 0:
+                v_acc += math.hypot(r - strip[i - 1][0], h - strip[i - 1][1]) * uv_v_scale
+            start = len(points)
+            for j in range(segments + 1):
+                a = 2 * math.pi * j / segments
+                c, s = math.cos(a), math.sin(a)
+                if up == "Y":
+                    points.append((r * c, h, -r * s))
+                    normals.append((nr * c, nh, -nr * s))
+                else:
+                    points.append((r * c, r * s, h))
+                    normals.append((nr * c, nr * s, nh))
+                st.append((j / segments, v_acc))
+            rows.append(start)
+        ring_rows.append(rows)
+    face_rows = []
+    for rows in ring_rows:
+        for k in range(len(rows) - 1):
+            row_faces = []
+            for j in range(segments):
+                a0, a1 = rows[k] + j, rows[k] + j + 1
+                b0, b1 = rows[k + 1] + j, rows[k + 1] + j + 1
+                row_faces.append(len(counts))
+                counts.append(4)
+                indices.extend([a0, a1, b1, b0])
+            face_rows.append(row_faces)
+    mesh.CreatePointsAttr(points)
+    mesh.CreateNormalsAttr(normals)
+    mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
+    mesh.CreateFaceVertexCountsAttr(counts)
+    mesh.CreateFaceVertexIndicesAttr(indices)
+    mesh.CreateSubdivisionSchemeAttr("none")
+    mesh.CreateExtentAttr(UsdGeom.PointBased.ComputeExtent(Vt.Vec3fArray(points)))
+    UsdGeom.PrimvarsAPI(mesh).CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex).Set(st)
+    return mesh, face_rows
+
+
+def torus(stage, path, R=0.6, r=0.2, seg_u=64, seg_v=24):
+    mesh = UsdGeom.Mesh.Define(stage, path)
+    pts, nrm, st, counts, idx = [], [], [], [], []
+    for i in range(seg_u + 1):
+        u = 2 * math.pi * i / seg_u
+        for j in range(seg_v + 1):
+            v = 2 * math.pi * j / seg_v
+            cx, cz = math.cos(u), math.sin(u)
+            nx, ny, nz = math.cos(v) * cx, math.sin(v), math.cos(v) * cz
+            pts.append(((R + r * math.cos(v)) * cx, r * math.sin(v), (R + r * math.cos(v)) * cz))
+            nrm.append((nx, ny, nz))
+            st.append((i / seg_u, j / seg_v))
+    w = seg_v + 1
+    for i in range(seg_u):
+        for j in range(seg_v):
+            a, b = i * w + j, (i + 1) * w + j
+            counts.append(4)
+            idx.extend([a, a + 1, b + 1, b])
+    mesh.CreatePointsAttr(pts)
+    mesh.CreateNormalsAttr(nrm)
+    mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
+    mesh.CreateFaceVertexCountsAttr(counts)
+    mesh.CreateFaceVertexIndicesAttr(idx)
+    mesh.CreateSubdivisionSchemeAttr("none")
+    UsdGeom.PrimvarsAPI(mesh).CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex).Set(st)
+    return mesh
+
+
+def set_stage_meta(stage, up="Y", mpu=1.0, default_prim=None, start=None, end=None, fps=24):
+    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.y if up == "Y" else UsdGeom.Tokens.z)
+    UsdGeom.SetStageMetersPerUnit(stage, mpu)
+    if default_prim:
+        stage.SetDefaultPrim(stage.GetPrimAtPath(default_prim))
+    if start is not None:
+        stage.SetStartTimeCode(start)
+        stage.SetEndTimeCode(end)
+        stage.SetTimeCodesPerSecond(fps)
+        stage.SetFramesPerSecond(fps)
+
+
+# ---------------------------------------------------------------- samples
+
+
+def sample_primitives():
+    """ASCII .usda: UsdGeom primitives, PreviewSurface materials, textures, light, animation."""
+    path = os.path.join(OUT, "primitives.usda")
+    stage = Usd.Stage.CreateNew(path)
+    world = UsdGeom.Xform.Define(stage, "/World")
+    stage.GetRootLayer().documentation = "UsdGeom primitive showcase for the web viewer"
+
+    looks = "/World/Looks"
+    red = make_material(stage, looks + "/RedPlastic", (0.80, 0.08, 0.06), 0.0, 0.35)
+    gold = make_material(stage, looks + "/Gold", (1.0, 0.77, 0.34), 1.0, 0.25)
+    blue = make_material(stage, looks + "/BlueGlass", (0.15, 0.45, 0.95), 0.0, 0.05, opacity=0.45)
+    green = make_material(stage, looks + "/GreenRubber", (0.20, 0.62, 0.30), 0.0, 0.85)
+    white = make_material(stage, looks + "/Porcelain", (0.92, 0.92, 0.90), 0.0, 0.2)
+    glow = make_material(stage, looks + "/Glow", (0.1, 0.1, 0.1), 0.0, 0.5, emissive=(1.0, 0.45, 0.1))
+    floor_mat = make_material(stage, looks + "/Checker", texture="./textures/checker.png", roughness=0.8)
+
+    floor = quad_plane(stage, "/World/Floor", 12, 6)
+    bind(floor, floor_mat)
+
+    shapes = UsdGeom.Xform.Define(stage, "/World/Shapes")
+    cube = UsdGeom.Cube.Define(stage, "/World/Shapes/Cube")
+    cube.CreateSizeAttr(1.0)
+    cube.AddTranslateOp().Set((-3.0, 0.5, 0.0))
+    cube.AddRotateYOp().Set(20.0)
+    bind(cube, red)
+
+    sphere = UsdGeom.Sphere.Define(stage, "/World/Shapes/Sphere")
+    sphere.CreateRadiusAttr(0.6)
+    sphere.AddTranslateOp().Set((-1.5, 0.6, 0.0))
+    bind(sphere, gold)
+
+    cyl = UsdGeom.Cylinder.Define(stage, "/World/Shapes/Cylinder")
+    cyl.CreateRadiusAttr(0.5)
+    cyl.CreateHeightAttr(1.2)
+    cyl.CreateAxisAttr("Y")
+    cyl.AddTranslateOp().Set((0.0, 0.6, 0.0))
+    bind(cyl, blue)
+
+    cone = UsdGeom.Cone.Define(stage, "/World/Shapes/Cone")
+    cone.CreateRadiusAttr(0.5)
+    cone.CreateHeightAttr(1.2)
+    cone.CreateAxisAttr("Y")
+    cone.AddTranslateOp().Set((1.5, 0.6, 0.0))
+    bind(cone, green)
+
+    cap = UsdGeom.Capsule.Define(stage, "/World/Shapes/Capsule")
+    cap.CreateRadiusAttr(0.35)
+    cap.CreateHeightAttr(0.8)
+    cap.CreateAxisAttr("Y")
+    cap.AddTranslateOp().Set((3.0, 0.75, 0.0))
+    bind(cap, white)
+
+    spinner = UsdGeom.Xform.Define(stage, "/World/Spinner")
+    spinner.AddTranslateOp().Set((0.0, 1.9, -2.0))
+    rot = spinner.AddRotateXYZOp()
+    for f, v in [(0, (0, 0, 0)), (60, (180, 90, 0)), (120, (360, 180, 0))]:
+        rot.Set(Gf.Vec3f(*v), f)
+    ring = torus(stage, "/World/Spinner/Torus")
+    bind(ring, gold)
+    core = UsdGeom.Sphere.Define(stage, "/World/Spinner/Core")
+    core.CreateRadiusAttr(0.25)
+    bind(core, glow)
+
+    sun = UsdLux.DistantLight.Define(stage, "/World/Sun")
+    sun.CreateIntensityAttr(2.0)
+    sun.CreateAngleAttr(1.0)
+    sun.AddRotateXYZOp().Set((-50.0, 30.0, 0.0))
+
+    set_stage_meta(stage, "Y", 1.0, "/World", 0, 120, 24)
+    stage.GetRootLayer().Save()
+    return path
+
+
+def sample_vases():
+    """Binary .usdc: Z-up, centimeters, lathe meshes with normals/UVs, GeomSubsets."""
+    path = os.path.join(OUT, "vases_zup_cm.usdc")
+    stage = Usd.Stage.CreateNew(path)
+    UsdGeom.Xform.Define(stage, "/Vases")
+    looks = "/Vases/Looks"
+    celadon = make_material(stage, looks + "/Celadon", (0.55, 0.75, 0.66), 0.0, 0.18)
+    terracotta = make_material(stage, looks + "/Terracotta", (0.70, 0.33, 0.20), 0.0, 0.9)
+    striped = make_material(stage, looks + "/Striped", texture="./textures/stripes.png", roughness=0.3)
+    gold = make_material(stage, looks + "/GoldRim", (1.0, 0.78, 0.36), 1.0, 0.2)
+    black = make_material(stage, looks + "/BlackGlaze", (0.03, 0.03, 0.035), 0.0, 0.08)
+
+    base = quad_plane(stage, "/Vases/Plinth", 90, 1, up="Z")
+    bind(base, make_material(stage, looks + "/Plinth", (0.85, 0.84, 0.80), 0.0, 0.7))
+
+    def profile_vase(h, belly, neck, lip):
+        body = []
+        steps = 28
+        for i in range(steps + 1):
+            t = i / steps
+            r = belly * math.sin(math.pi * min(t * 1.15, 1.0)) ** 0.8 + neck * t
+            r = max(r, neck if t > 0.85 else 0.6 * belly * (1 - t) + neck)
+            body.append((r, h * t))
+        body[0] = (belly * 0.55, 0.0)
+        bottom = [(0.0, 0.0), (belly * 0.55, 0.0)]
+        rim = [(body[-1][0], h), (lip, h + 0.6), (lip - 0.6, h + 0.6)]
+        return [bottom, body, rim]
+
+    specs = [
+        ("Amphora", (-30, 0), 34, 9.0, 3.2, 4.6, celadon),
+        ("Jar", (0, 8), 22, 10.5, 6.5, 7.4, terracotta),
+        ("Bottle", (28, -2), 30, 7.0, 1.6, 2.4, striped),
+        ("Bowl", (6, -24), 9, 13.0, 12.5, 13.5, black),
+    ]
+    for name, (x, y), h, belly, neck, lip, mat in specs:
+        xf = UsdGeom.Xform.Define(stage, f"/Vases/{name}")
+        xf.AddTranslateOp().Set((x, y, 0.0))
+        mesh, face_rows = lathe(stage, f"/Vases/{name}/Geom", profile_vase(h, belly, neck, lip), up="Z", uv_v_scale=1 / 12)
+        bind(mesh, mat)
+        # Gold rim as a GeomSubset on the last two face rows.
+        rim_faces = [f for row in face_rows[-2:] for f in row]
+        subset = UsdGeom.Subset.CreateGeomSubset(mesh, "Rim", UsdGeom.Tokens.face, Vt.IntArray(rim_faces), "materialBind")
+        bind(subset, gold)
+        UsdShade.MaterialBindingAPI(mesh.GetPrim()).SetMaterialBindSubsetsFamilyType(UsdGeom.Tokens.nonOverlapping)
+
+    set_stage_meta(stage, "Z", 0.01, "/Vases")
+    stage.GetRootLayer().Save()
+    return path
+
+
+def asset_stool():
+    path = os.path.join(OUT, "props", "stool.usda")
+    stage = Usd.Stage.CreateNew(path)
+    root = UsdGeom.Xform.Define(stage, "/Stool")
+    Usd.ModelAPI(root).SetKind("component")
+    wood = make_material(stage, "/Stool/Looks/Oak", texture="./textures/wood.png", roughness=0.55)
+    metal = make_material(stage, "/Stool/Looks/BrushedSteel", (0.75, 0.76, 0.78), 1.0, 0.35)
+    seat, _ = lathe(stage, "/Stool/Seat", [[(0.0, 0.0), (0.19, 0.0)], [(0.19, 0.0), (0.2, 0.02), (0.19, 0.045)], [(0.19, 0.045), (0.0, 0.05)]], up="Y")
+    seat.AddTranslateOp().Set((0, 0.45, 0))
+    bind(seat, wood)
+    legs = UsdGeom.Xform.Define(stage, "/Stool/Legs")
+    for i, (x, z) in enumerate([(0.12, 0.12), (-0.12, 0.12), (-0.12, -0.12), (0.12, -0.12)]):
+        leg = UsdGeom.Cylinder.Define(stage, f"/Stool/Legs/Leg{i + 1}")
+        leg.CreateRadiusAttr(0.018)
+        leg.CreateHeightAttr(0.45)
+        leg.CreateAxisAttr("Y")
+        leg.AddTranslateOp().Set((x, 0.225, z))
+        bind(leg, metal)
+    ring = UsdGeom.Xform.Define(stage, "/Stool/Legs/FootRing")
+    ring.AddTranslateOp().Set((0, 0.16, 0))
+    ring.AddScaleOp().Set((0.29, 0.06, 0.29))
+    t = torus(stage, "/Stool/Legs/FootRing/Ring", R=0.6, r=0.05)
+    bind(t, metal)
+    set_stage_meta(stage, "Y", 1.0, "/Stool")
+    stage.GetRootLayer().Save()
+
+
+def asset_table():
+    path = os.path.join(OUT, "props", "table.usda")
+    stage = Usd.Stage.CreateNew(path)
+    root = UsdGeom.Xform.Define(stage, "/Table")
+    Usd.ModelAPI(root).SetKind("component")
+    wood = make_material(stage, "/Table/Looks/Walnut", texture="./textures/wood.png", roughness=0.4)
+    paint = make_material(stage, "/Table/Looks/MattBlack", (0.05, 0.05, 0.05), 0.0, 0.7)
+    top = UsdGeom.Cube.Define(stage, "/Table/Top")
+    top.CreateSizeAttr(1.0)
+    top.AddTranslateOp().Set((0, 0.74, 0))
+    top.AddScaleOp().Set((1.6, 0.04, 0.9))
+    bind(top, wood)
+    for i, (x, z) in enumerate([(0.72, 0.38), (-0.72, 0.38), (-0.72, -0.38), (0.72, -0.38)]):
+        leg = UsdGeom.Cube.Define(stage, f"/Table/Leg{i + 1}")
+        leg.CreateSizeAttr(1.0)
+        leg.AddTranslateOp().Set((x, 0.36, z))
+        leg.AddScaleOp().Set((0.05, 0.72, 0.05))
+        bind(leg, paint)
+    set_stage_meta(stage, "Y", 1.0, "/Table")
+    stage.GetRootLayer().Save()
+
+
+def sample_assembly():
+    """Crate-encoded .usd: references to ASCII assets in a sub folder."""
+    asset_stool()
+    asset_table()
+    path = os.path.join(OUT, "kitchen_assembly.usd")
+    stage = Usd.Stage.CreateNew(path)
+    scene = UsdGeom.Xform.Define(stage, "/Scene")
+    Usd.ModelAPI(scene).SetKind("assembly")
+    floor = quad_plane(stage, "/Scene/Floor", 5, 5)
+    bind(floor, make_material(stage, "/Scene/Looks/Tiles", texture="./textures/tiles.png", roughness=0.6))
+
+    table = stage.DefinePrim("/Scene/Table", "Xform")
+    table.GetReferences().AddReference("./props/table.usda")
+
+    placements = [(0.45, 0.62, 0), (-0.45, 0.62, 15), (0.45, -0.62, -10), (-0.45, -0.62, 200), (1.15, 0.0, 95)]
+    for i, (x, z, ry) in enumerate(placements):
+        stool = stage.DefinePrim(f"/Scene/Stool_{i + 1:02d}", "Xform")
+        stool.GetReferences().AddReference("./props/stool.usda")
+        xf = UsdGeom.Xformable(stool)
+        xf.AddTranslateOp().Set((x, 0, z))
+        xf.AddRotateYOp().Set(float(ry))
+
+    set_stage_meta(stage, "Y", 1.0, "/Scene")
+    stage.GetRootLayer().Save()
+    return path
+
+
+def sample_sublayers():
+    """ASCII root layer that sublayers a set layer from another folder and overrides it."""
+    set_path = os.path.join(OUT, "layers", "set.usda")
+    stage = Usd.Stage.CreateNew(set_path)
+    UsdGeom.Xform.Define(stage, "/World")
+    red = make_material(stage, "/World/Looks/Red", (0.85, 0.1, 0.08), 0.0, 0.3)
+    blue = make_material(stage, "/World/Looks/Blue", (0.1, 0.3, 0.9), 0.0, 0.3)
+    make_material(stage, "/World/Looks/Green", (0.15, 0.7, 0.25), 0.0, 0.3)
+    ground = quad_plane(stage, "/World/Ground", 6, 3)
+    bind(ground, make_material(stage, "/World/Looks/Checker", texture="../textures/checker.png", roughness=0.8))
+    ball = UsdGeom.Sphere.Define(stage, "/World/Ball")
+    ball.CreateRadiusAttr(0.5)
+    ball.AddTranslateOp().Set((-1.0, 0.5, 0.0))
+    bind(ball, red)
+    box = UsdGeom.Cube.Define(stage, "/World/Box")
+    box.CreateSizeAttr(0.8)
+    box.AddTranslateOp().Set((1.0, 0.4, 0.0))
+    bind(box, blue)
+    set_stage_meta(stage, "Y", 1.0, "/World")
+    stage.GetRootLayer().Save()
+
+    shot_path = os.path.join(OUT, "sublayers_shot.usda")
+    shot = Usd.Stage.CreateNew(shot_path)
+    shot.GetRootLayer().subLayerPaths.append("./layers/set.usda")
+    ball_over = shot.OverridePrim("/World/Ball")
+    ball_over.GetAttribute("xformOp:translate").Set(Gf.Vec3d(-1.0, 1.2, 0.6))
+    UsdShade.MaterialBindingAPI.Apply(ball_over).Bind(UsdShade.Material(shot.GetPrimAtPath("/World/Looks/Green")))
+    cone = UsdGeom.Cone.Define(shot, "/World/AddedInShot")
+    cone.CreateRadiusAttr(0.35)
+    cone.CreateHeightAttr(0.9)
+    cone.CreateAxisAttr("Y")
+    cone.AddTranslateOp().Set((0.0, 0.45, -1.2))
+    UsdShade.MaterialBindingAPI.Apply(cone.GetPrim()).Bind(UsdShade.Material(shot.GetPrimAtPath("/World/Looks/Red")))
+    set_stage_meta(shot, "Y", 1.0, "/World")
+    shot.GetRootLayer().Save()
+    return shot_path
+
+
+def sample_skinned():
+    """ASCII .usda: UsdSkel tube driven by a SkelAnimation."""
+    path = os.path.join(OUT, "skinned_tentacle.usda")
+    stage = Usd.Stage.CreateNew(path)
+    root = UsdSkel.Root.Define(stage, "/Tentacle")
+    skel = UsdSkel.Skeleton.Define(stage, "/Tentacle/Skel")
+    n_joints = 5
+    seg = 0.6
+    joints, names = [], []
+    for i in range(n_joints):
+        names.append(f"J{i}")
+        joints.append("/".join(names))
+    skel.CreateJointsAttr(joints)
+    bind_xf = [Gf.Matrix4d().SetTranslate(Gf.Vec3d(0, i * seg, 0)) for i in range(n_joints)]
+    rest_xf = [Gf.Matrix4d().SetTranslate(Gf.Vec3d(0, 0 if i == 0 else seg, 0)) for i in range(n_joints)]
+    skel.CreateBindTransformsAttr(bind_xf)
+    skel.CreateRestTransformsAttr(rest_xf)
+
+    anim = UsdSkel.Animation.Define(stage, "/Tentacle/Skel/Wave")
+    anim.CreateJointsAttr(joints)
+    anim.CreateTranslationsAttr([Gf.Vec3f(0, 0 if i == 0 else seg, 0) for i in range(n_joints)])
+    anim.CreateScalesAttr([Gf.Vec3h(1, 1, 1)] * n_joints)
+    rot_attr = anim.CreateRotationsAttr()
+    for f in range(0, 97, 4):
+        rots = []
+        for i in range(n_joints):
+            ang = 0 if i == 0 else 22 * math.sin(f / 96 * 2 * math.pi + i * 0.7)
+            q = Gf.Rotation(Gf.Vec3d(0, 0, 1), ang).GetQuat()
+            rots.append(Gf.Quatf(q.GetReal(), Gf.Vec3f(q.GetImaginary())))
+        rot_attr.Set(rots, f)
+    UsdSkel.BindingAPI.Apply(skel.GetPrim()).CreateAnimationSourceRel().SetTargets([anim.GetPath()])
+
+    # Tapered tube along +Y.
+    rings, sides = 24, 20
+    height = seg * (n_joints - 1) + 0.3
+    mesh = UsdGeom.Mesh.Define(stage, "/Tentacle/Tube")
+    pts, nrm, counts, idx, jidx, jw = [], [], [], [], [], []
+    for r in range(rings + 1):
+        y = height * r / rings
+        rad = 0.28 * (1 - 0.8 * r / rings) + 0.02
+        f = y / seg
+        j0 = min(int(f), n_joints - 1)
+        j1 = min(j0 + 1, n_joints - 1)
+        w1 = min(max(f - j0, 0.0), 1.0) if j1 != j0 else 0.0
+        for s in range(sides):
+            a = 2 * math.pi * s / sides
+            pts.append((rad * math.cos(a), y, rad * math.sin(a)))
+            nrm.append((math.cos(a), 0.15, math.sin(a)))
+            jidx.extend([j0, j1])
+            jw.extend([1 - w1, w1])
+    for r in range(rings):
+        for s in range(sides):
+            a = r * sides + s
+            b = r * sides + (s + 1) % sides
+            counts.append(4)
+            idx.extend([a, (r + 1) * sides + s, (r + 1) * sides + (s + 1) % sides, b])
+    mesh.CreatePointsAttr(pts)
+    mesh.CreateNormalsAttr(nrm)
+    mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
+    mesh.CreateFaceVertexCountsAttr(counts)
+    mesh.CreateFaceVertexIndicesAttr(idx)
+    mesh.CreateSubdivisionSchemeAttr("none")
+    binding = UsdSkel.BindingAPI.Apply(mesh.GetPrim())
+    binding.CreateSkeletonRel().SetTargets([skel.GetPath()])
+    binding.CreateJointIndicesPrimvar(False, 2).Set(jidx)
+    binding.CreateJointWeightsPrimvar(False, 2).Set(jw)
+    binding.CreateGeomBindTransformAttr(Gf.Matrix4d(1))
+    bind(mesh, make_material(stage, "/Tentacle/Looks/Coral", (0.95, 0.42, 0.38), 0.0, 0.45))
+
+    set_stage_meta(stage, "Y", 1.0, "/Tentacle", 0, 96, 24)
+    stage.GetRootLayer().Save()
+    return path
+
+
+def sample_composition():
+    """Binary .usdc: variants, payloads, explicit-prim references, inactive/invisible/over-only prims."""
+    lib = Usd.Stage.CreateNew(os.path.join(OUT, "parts", "hardware.usdc"))
+    UsdGeom.Xform.Define(lib, "/Gear")
+    gear, _ = lathe(lib, "/Gear/Body", [[(0.0, 0.0), (0.5, 0.0)], [(0.5, 0.0), (0.5, 0.15)], [(0.5, 0.15), (0.0, 0.15)]], segments=12)
+    bind(gear, make_material(lib, "/Gear/Looks/Brass", (0.85, 0.62, 0.25), 1.0, 0.3))
+    UsdGeom.Xform.Define(lib, "/Bolt")
+    head = UsdGeom.Cylinder.Define(lib, "/Bolt/Head")
+    head.CreateRadiusAttr(0.18)
+    head.CreateHeightAttr(0.12)
+    head.CreateAxisAttr("Y")
+    head.AddTranslateOp().Set((0, 0.5, 0))
+    shaft = UsdGeom.Cylinder.Define(lib, "/Bolt/Shaft")
+    shaft.CreateRadiusAttr(0.07)
+    shaft.CreateHeightAttr(0.5)
+    shaft.CreateAxisAttr("Y")
+    shaft.AddTranslateOp().Set((0, 0.25, 0))
+    steel = make_material(lib, "/Bolt/Looks/Steel", (0.7, 0.72, 0.75), 1.0, 0.25)
+    bind(head, steel)
+    bind(shaft, steel)
+    set_stage_meta(lib, "Y", 1.0, "/Gear")
+    lib.GetRootLayer().Save()
+
+    path = os.path.join(OUT, "composition_arcs.usdc")
+    st = Usd.Stage.CreateNew(path)
+    UsdGeom.Xform.Define(st, "/World")
+    looks = "/World/Looks"
+    colors = {"Red": (0.85, 0.15, 0.12), "Teal": (0.1, 0.6, 0.6), "Violet": (0.5, 0.3, 0.85)}
+    mats = {k: make_material(st, f"{looks}/{k}", c, 0.0, 0.35) for k, c in colors.items()}
+
+    # Payload to the library's defaultPrim, and a reference to an explicit non-default prim.
+    gear_prim = st.DefinePrim("/World/GearPayload", "Xform")
+    gear_prim.GetPayloads().AddPayload("./parts/hardware.usdc")
+    UsdGeom.Xformable(gear_prim).AddTranslateOp().Set((-1.2, 0, 0))
+    bolt_prim = st.DefinePrim("/World/BoltReference", "Xform")
+    bolt_prim.GetReferences().AddReference("./parts/hardware.usdc", "/Bolt")
+    UsdGeom.Xformable(bolt_prim).AddTranslateOp().Set((0, 0, 0))
+
+    # Variant set: the viewer composes the authored selection ("ball").
+    shape = UsdGeom.Xform.Define(st, "/World/Shape")
+    shape.AddTranslateOp().Set((1.2, 0.4, 0))
+    vset = shape.GetPrim().GetVariantSets().AddVariantSet("shape")
+    for name in ("box", "ball", "cone"):
+        vset.AddVariant(name)
+        vset.SetVariantSelection(name)
+        with vset.GetVariantEditContext():
+            geo = {"box": UsdGeom.Cube, "ball": UsdGeom.Sphere, "cone": UsdGeom.Cone}[name].Define(st, "/World/Shape/Geo")
+            if name == "box":
+                geo.CreateSizeAttr(0.8)
+            elif name == "ball":
+                geo.CreateRadiusAttr(0.4)
+            else:
+                geo.CreateRadiusAttr(0.4)
+                geo.CreateHeightAttr(0.8)
+                geo.CreateAxisAttr("Y")
+            bind(geo, mats[{"box": "Red", "ball": "Teal", "cone": "Violet"}[name]])
+    vset.SetVariantSelection("ball")
+
+    # Prims a USD renderer would not draw.
+    inactive = UsdGeom.Sphere.Define(st, "/World/Inactive")
+    inactive.GetPrim().SetActive(False)
+    invisible = UsdGeom.Cube.Define(st, "/World/Invisible")
+    invisible.AddTranslateOp().Set((0, 0.5, 1.2))
+    invisible.MakeInvisible()
+    guide = UsdGeom.Cube.Define(st, "/World/GuideBox")
+    guide.CreatePurposeAttr("guide")
+    st.CreateClassPrim("/_Template")
+    st.OverridePrim("/World/OverOnly")
+
+    floor = quad_plane(st, "/World/Floor", 4, 4)
+    bind(floor, make_material(st, f"{looks}/Checker", texture="./textures/checker.png", roughness=0.8))
+    set_stage_meta(st, "Y", 1.0, "/World")
+    st.GetRootLayer().Save()
+    return path
+
+
+def main():
+    os.makedirs(os.path.join(OUT, "textures"), exist_ok=True)
+    os.makedirs(os.path.join(OUT, "props", "textures"), exist_ok=True)
+    os.makedirs(os.path.join(OUT, "layers"), exist_ok=True)
+    os.makedirs(os.path.join(OUT, "parts"), exist_ok=True)
+    write_checker(os.path.join(OUT, "textures", "checker.png"))
+    write_stripes(os.path.join(OUT, "textures", "stripes.png"))
+    write_tiles(os.path.join(OUT, "textures", "tiles.png"))
+    write_wood(os.path.join(OUT, "props", "textures", "wood.png"))
+
+    outputs = [sample_primitives(), sample_vases(), sample_assembly(), sample_sublayers(), sample_skinned(), sample_composition()]
+
+    usdz = os.path.join(OUT, "kitchen_packaged.usdz")
+    UsdUtils.CreateNewUsdzPackage(Sdf.AssetPath(os.path.join(OUT, "kitchen_assembly.usd")), usdz)
+    outputs.append(usdz)
+
+    for p in outputs:
+        print(f"{os.path.relpath(p, OUT):32s} {os.path.getsize(p):>9,d} bytes")
+
+
+if __name__ == "__main__":
+    main()

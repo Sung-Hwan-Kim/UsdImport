@@ -1,0 +1,116 @@
+#usda 1.0
+(
+    defaultPrim = "Table"
+    metersPerUnit = 1
+    upAxis = "Y"
+)
+
+def Xform "Table" (
+    kind = "component"
+)
+{
+    def "Looks"
+    {
+        def Material "Walnut"
+        {
+            token outputs:surface.connect = </Table/Looks/Walnut/PreviewSurface.outputs:surface>
+
+            def Shader "PreviewSurface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor.connect = </Table/Looks/Walnut/DiffuseTexture.outputs:rgb>
+                float inputs:metallic = 0
+                float inputs:roughness = 0.4
+                token outputs:surface
+            }
+
+            def Shader "STReader"
+            {
+                uniform token info:id = "UsdPrimvarReader_float2"
+                token inputs:varname = "st"
+                float2 outputs:result
+            }
+
+            def Shader "DiffuseTexture"
+            {
+                uniform token info:id = "UsdUVTexture"
+                asset inputs:file = @./textures/wood.png@
+                token inputs:sourceColorSpace = "sRGB"
+                float2 inputs:st.connect = </Table/Looks/Walnut/STReader.outputs:result>
+                token inputs:wrapS = "repeat"
+                token inputs:wrapT = "repeat"
+                float3 outputs:rgb
+            }
+        }
+
+        def Material "MattBlack"
+        {
+            token outputs:surface.connect = </Table/Looks/MattBlack/PreviewSurface.outputs:surface>
+
+            def Shader "PreviewSurface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.05, 0.05, 0.05)
+                float inputs:metallic = 0
+                float inputs:roughness = 0.7
+                token outputs:surface
+            }
+        }
+    }
+
+    def Cube "Top" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </Table/Looks/Walnut>
+        double size = 1
+        float3 xformOp:scale = (1.6, 0.04, 0.9)
+        double3 xformOp:translate = (0, 0.74, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+    }
+
+    def Cube "Leg1" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </Table/Looks/MattBlack>
+        double size = 1
+        float3 xformOp:scale = (0.05, 0.72, 0.05)
+        double3 xformOp:translate = (0.72, 0.36, 0.38)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+    }
+
+    def Cube "Leg2" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </Table/Looks/MattBlack>
+        double size = 1
+        float3 xformOp:scale = (0.05, 0.72, 0.05)
+        double3 xformOp:translate = (-0.72, 0.36, 0.38)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+    }
+
+    def Cube "Leg3" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </Table/Looks/MattBlack>
+        double size = 1
+        float3 xformOp:scale = (0.05, 0.72, 0.05)
+        double3 xformOp:translate = (-0.72, 0.36, -0.38)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+    }
+
+    def Cube "Leg4" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </Table/Looks/MattBlack>
+        double size = 1
+        float3 xformOp:scale = (0.05, 0.72, 0.05)
+        double3 xformOp:translate = (0.72, 0.36, -0.38)
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+    }
+}
+

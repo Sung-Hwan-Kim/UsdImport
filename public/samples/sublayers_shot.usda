@@ -1,0 +1,33 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    subLayers = [
+        @./layers/set.usda@
+    ]
+    upAxis = "Y"
+)
+
+over "World"
+{
+    over "Ball" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        rel material:binding = </World/Looks/Green>
+        double3 xformOp:translate = (-1, 1.2, 0.6)
+    }
+
+    def Cone "AddedInShot" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token axis = "Y"
+        double height = 0.9
+        rel material:binding = </World/Looks/Red>
+        double radius = 0.35
+        double3 xformOp:translate = (0, 0.45, -1.2)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}
+
