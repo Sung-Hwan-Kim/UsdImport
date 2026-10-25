@@ -38,6 +38,7 @@ declare module "three/examples/jsm/loaders/usd/USDCParser.js" {
     protected _readPaths(): void;
     protected _readScalarValue(type: number): unknown;
     protected _readInlinedValue(valueRep: CrateValueRep): unknown;
+    protected _readHalf(): number;
   }
 }
 
@@ -70,6 +71,7 @@ declare module "three/examples/jsm/loaders/usd/USDComposer.js" {
       basePath?: string,
     ): Group;
 
+    applyTransform(obj: Object3D, fields: Record<string, unknown>, attrs?: Record<string, unknown>): void;
     protected _buildHierarchy(parent: Object3D, parentPath: string): void;
     protected _resolveReference(refValue: string, localVariants?: Record<string, string>): Group | null;
     protected _resolveFilePath(refPath: string): string;

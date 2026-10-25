@@ -55,6 +55,7 @@ npm run build && npm start
 - UsdGeom Mesh / Cube / Sphere / Cylinder / Cone / Capsule, GeomSubset 멀티 머티리얼
 - UsdPreviewSurface / OpenPBR 머티리얼과 텍스처(PNG/JPG/WebP/AVIF), UsdLux 라이트
 - UsdSkel 스키닝, SkelAnimation, 트랜스폼 time sample 애니메이션
+- 트랜스폼: `xformOpOrder`를 USD 규칙대로 평가 — 접미사 op(`xformOp:scale:pivot` 등), 모든 회전 순서(`rotateZYX` 등), `!invert!`, Maya 피벗, `!resetXformStack!`, half 정밀도 값, 참조 대상과 참조하는 프림의 xform 값 합성
 - `upAxis`(Z-up → Y-up)와 `metersPerUnit` 자동 변환
 - 인스펙터: 트랜스폼, 지오메트리, 머티리얼(텍스처 썸네일 포함), 각 스펙의 USD 원본 프로퍼티
 

@@ -14,6 +14,7 @@ import {
 import { USDComposer } from "three/examples/jsm/loaders/usd/USDComposer.js";
 import type { USDLayerData, USDSpec } from "three/examples/jsm/loaders/usd/USDCParser.js";
 import { dirname, normalizePath } from "./paths";
+import { evaluateXformOps, mergeXformOpinions, setFromXform, xformOpinionsOf, type XformOpinions } from "./xformOps";
 
 /** Where an Object3D came from, stored on `object.userData.usd`. */
 export interface PrimTag {
@@ -53,6 +54,9 @@ export interface ComposeContext {
   instanceCount: number;
 }
 
+/** The xform opinions each object's transform was built from, for prims that reference it. */
+const builtXforms = new WeakMap<Object3D, XformOpinions>();
+
 function isContainer(obj: Object3D): boolean {
   return obj.type === "Object3D" || obj.type === "Group";
 }
@@ -77,6 +81,8 @@ export class ViewerComposer extends USDComposer {
   private readonly tagged = new WeakSet<Object3D>();
   private referencingSpec: USDSpec | null = null;
   private readonly dissolvedTargets = new Map<USDSpec, PrimTag>();
+  /** Reference targets' xform opinions, keyed by the referencing prim's fields. */
+  private readonly referencedXforms = new Map<Record<string, unknown>, XformOpinions>();
   private readonly instance: number;
 
   constructor(
@@ -166,6 +172,22 @@ export class ViewerComposer extends USDComposer {
     return this.specsByPath[`${primPath}.${name}`]?.fields.default;
   }
 
+  /**
+   * three evaluates only a fixed set of unsuffixed op names and applies ops
+   * even without xformOpOrder. Evaluate the order as USD does instead, with a
+   * referencing prim's opinions composed over its reference targets'.
+   */
+  override applyTransform(obj: Object3D, fields: Record<string, unknown>, attrs: Record<string, unknown> = {}): void {
+    const own = xformOpinionsOf({ ...fields, ...attrs });
+    const referenced = this.referencedXforms.get(fields);
+    const xform = referenced ? mergeXformOpinions(own, referenced) : own;
+    builtXforms.set(obj, xform);
+    const evaluated = evaluateXformOps(xform);
+    for (const op of evaluated.unsupported) this.ctx.warnings.add(`지원하지 않는 xformOp를 건너뛰었습니다: ${op}`);
+    setFromXform(obj, evaluated);
+    if (evaluated.resetsXformStack) obj.userData.resetXformStack = true;
+  }
+
   protected override _getReferences(spec: USDSpec): string[] {
     // Remember which prim is referencing so _resolveReference can see its opinions.
     this.referencingSpec = spec;
@@ -210,22 +232,29 @@ export class ViewerComposer extends USDComposer {
     }
 
     // In USD the target prim *becomes* the referencing prim: its children land
-    // directly under it, and the referencing prim's own transform is stronger.
+    // directly under it, and its xform opinions compose under the referencing
+    // prim's per attribute, so the referencing prim carries the transform.
     target.removeFromParent();
+    const targetXform = builtXforms.get(target);
+    const fields = this.referencingSpec?.fields;
+    if (targetXform && fields) {
+      // Earlier references in the list are stronger.
+      const stronger = this.referencedXforms.get(fields);
+      this.referencedXforms.set(fields, stronger ? mergeXformOpinions(stronger, targetXform) : targetXform);
+    }
+    if (targetXform || this.referencingPrimHasTransform()) {
+      target.position.set(0, 0, 0);
+      target.quaternion.identity();
+      target.scale.set(1, 1, 1);
+    }
     const wrapper = new Group();
-    const ownTransform = this.referencingPrimHasTransform();
-    if (isContainer(target) && (ownTransform || !this._hasNonIdentityTransform(target))) {
+    if (isContainer(target) && !this._hasNonIdentityTransform(target)) {
       while (target.children.length) wrapper.add(target.children[0]);
       // The target dissolves into the referencing prim; remember it so its
       // opinions (e.g. an asset root's RigidBodyAPI) stay reachable.
       const targetTag = getPrimTag(target);
       if (targetTag && this.referencingSpec) this.dissolvedTargets.set(this.referencingSpec, targetTag);
     } else {
-      if (ownTransform) {
-        target.position.set(0, 0, 0);
-        target.quaternion.identity();
-        target.scale.set(1, 1, 1);
-      }
       wrapper.add(target);
     }
     return wrapper;

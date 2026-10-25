@@ -14,6 +14,7 @@ import {
 } from "./layers";
 import { basename, dirname, isImageFile, isLayerFile, isUnsupportedImage, isUrl, joinPath, normalizePath } from "./paths";
 import { MemorySource, PathIndex, type AssetSource } from "./sources";
+import { applyResetXformStacks } from "./xformOps";
 
 export type LayerRole = "root" | "sublayer" | "reference";
 
@@ -237,6 +238,7 @@ export async function loadStage(source: AssetSource, requestedRoot: string, opti
   scene.name = name;
   scene.animations = [...scene.animations, ...ctx.animations];
   scene.userData.usd = { layer: rootPath, path: "/", instance: 0, typeName: "Stage" } satisfies PrimTag;
+  applyResetXformStacks(scene);
   const composeTime = performance.now() - tCompose;
 
   const tTextures = performance.now();

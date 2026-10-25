@@ -9,6 +9,15 @@ const LayerOffsetVector = 49;
 const StringVector = 50;
 const PayloadListOp = 55;
 
+// Half-precision scalars three only reads inlined or as arrays (e.g. a half3
+// xformOp:scale). Type enum -> component count.
+const HALF_VECTORS: Record<number, number> = {
+  18: 4, // Quath
+  21: 2, // Vec2h
+  25: 3, // Vec3h
+  29: 4, // Vec4h
+};
+
 // Vectors whose components are all small integers are inlined as int8s; three
 // only decodes the float/int variants. Type enum -> component count.
 const INLINED_INT8_VECTORS: Record<number, number> = {
@@ -76,6 +85,8 @@ export class CrateParser extends USDCParser {
   }
 
   protected override _readScalarValue(type: number): unknown {
+    const halves = HALF_VECTORS[type];
+    if (halves) return Array.from({ length: halves }, () => this._readHalf());
     switch (type) {
       case ReferenceListOp: {
         const arcs = this.readListOp(() => this.readReference()).filter((a) => a.assetPath);
