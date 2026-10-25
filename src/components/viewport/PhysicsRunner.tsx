@@ -244,11 +244,14 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Mouse grab: while running, a left-drag that starts on a dynamic body pulls
-  // it with a spring toward a point on a camera-facing plane. Listeners run in
-  // the capture phase so camera controls and click selection never see the drag.
+  // Mouse grab: once a simulation is loaded, a left-drag that starts on a dynamic
+  // body pulls it with a spring toward a point on a camera-facing plane (a paused
+  // simulation resumes). Listeners sit in the capture phase on the element camera
+  // controls and R3F listen on, so neither sees a press that lands on a body.
   useEffect(() => {
-    const canvas = get().gl.domElement;
+    const { gl, events } = get();
+    const canvas = gl.domElement;
+    const source = (events.connected as HTMLElement | undefined) ?? canvas;
     const raycaster = new Raycaster();
     const plane = new Plane();
     const ndc = new Vector2();
@@ -265,6 +268,8 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
       grabbing: boolean;
     } | null = null;
     let swallowClick = false;
+    let hover: PointerEvent | null = null;
+    let hoverFrame = 0;
 
     const setControls = (enabled: boolean) => {
       const controls = get().controls as { enabled?: boolean } | null;
@@ -277,31 +282,39 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
     };
     const toFrame = (s: Session, world: Vector3) =>
       s.result.frame === "stage" ? world.clone().applyMatrix4(tmpInverse.copy(stage.scene.matrixWorld).invert()) : world.clone();
-
-    const onDown = (e: PointerEvent) => {
+    /** The dynamic body under the pointer, if a simulation is loaded. */
+    const pick = (e: PointerEvent) => {
       const s = session.current;
-      if (!s || e.button !== 0 || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
-      if (useViewer.getState().physics.status !== "running") return;
+      const status = useViewer.getState().physics.status;
+      if (!s || (status !== "running" && status !== "paused")) return null;
       castRay(e);
       const hit = raycaster.intersectObject(stage.scene, true).find((h) => isShownInHierarchy(h.object));
-      if (!hit) return;
+      if (!hit) return null;
       let index = -1;
       for (let cur: Object3D | null = hit.object; cur && index < 0; cur = cur.parent) index = s.bodyIndex.get(cur) ?? -1;
-      if (index < 0 || s.result.kinematic[index]) return;
+      if (index < 0 || s.result.kinematic[index]) return null;
+      return { s, index, hit };
+    };
+
+    const onDown = (e: PointerEvent) => {
+      if (e.button !== 0 || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      const picked = pick(e);
+      if (!picked) return;
+      const { s, index, hit } = picked;
 
       e.stopImmediatePropagation();
       e.preventDefault();
       frameMatrix(s, s.result.bodies[index], tmpMatrix).decompose(tmpPosition, tmpQuaternion, tmpScale);
-      const target = toFrame(s, hit.point);
-      const local = target.clone().sub(tmpPosition).applyQuaternion(tmpQuaternion.invert());
+      const grabPoint = toFrame(s, hit.point);
+      const local = grabPoint.clone().sub(tmpPosition).applyQuaternion(tmpQuaternion.invert());
       plane.setFromNormalAndCoplanarPoint(get().camera.getWorldDirection(new Vector3()).negate(), hit.point);
       setControls(false);
       try {
-        canvas.setPointerCapture(e.pointerId);
+        source.setPointerCapture(e.pointerId);
       } catch {
         // Not an active pointer (e.g. synthetic events); moves still arrive while over the canvas.
       }
-      press = { pointerId: e.pointerId, x: e.clientX, y: e.clientY, index, object: hit.object, local, target, grabbing: false };
+      press = { pointerId: e.pointerId, x: e.clientX, y: e.clientY, index, object: hit.object, local, target: grabPoint, grabbing: false };
     };
     const onMove = (e: PointerEvent) => {
       const s = session.current;
@@ -311,17 +324,19 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
         press.grabbing = true;
         s.engine.beginDrag(press.index, press.local, press.target);
         canvas.style.cursor = "grabbing";
+        const { physics, physicsCommand } = useViewer.getState();
+        if (physics.status === "paused") physicsCommand("play");
       }
       castRay(e);
-      const target = raycaster.ray.intersectPlane(plane, new Vector3());
-      if (target) s.engine.updateDrag(toFrame(s, target));
+      const point = raycaster.ray.intersectPlane(plane, new Vector3());
+      if (point) s.engine.updateDrag(toFrame(s, point));
     };
     const onUp = () => {
       if (!press) return;
       if (press.grabbing) session.current?.engine.endDrag();
       else useViewer.getState().select(press.object);
       setControls(true);
-      if (canvas.hasPointerCapture(press.pointerId)) canvas.releasePointerCapture(press.pointerId);
+      if (source.hasPointerCapture(press.pointerId)) source.releasePointerCapture(press.pointerId);
       canvas.style.cursor = "";
       press = null;
       // The click that follows this pointerup was handled here; keep R3F from re-selecting.
@@ -333,19 +348,38 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
       swallowClick = false;
       e.stopImmediatePropagation();
     };
+    // Show an open hand over grabbable bodies, at most one raycast per frame.
+    const onHover = (e: PointerEvent) => {
+      if (press || e.buttons) return;
+      hover = e;
+      hoverFrame ||= requestAnimationFrame(() => {
+        hoverFrame = 0;
+        if (hover && !press) canvas.style.cursor = pick(hover) ? "grab" : "";
+      });
+    };
+    const onLeave = () => {
+      hover = null;
+      if (!press) canvas.style.cursor = "";
+    };
 
-    canvas.addEventListener("pointerdown", onDown, { capture: true });
-    canvas.addEventListener("pointermove", onMove);
-    canvas.addEventListener("pointerup", onUp);
-    canvas.addEventListener("pointercancel", onUp);
-    canvas.addEventListener("click", onClick, { capture: true });
+    source.addEventListener("pointerdown", onDown, { capture: true });
+    source.addEventListener("pointermove", onMove);
+    source.addEventListener("pointermove", onHover);
+    source.addEventListener("pointerleave", onLeave);
+    source.addEventListener("pointerup", onUp);
+    source.addEventListener("pointercancel", onUp);
+    source.addEventListener("click", onClick, { capture: true });
     return () => {
       onUp();
-      canvas.removeEventListener("pointerdown", onDown, { capture: true });
-      canvas.removeEventListener("pointermove", onMove);
-      canvas.removeEventListener("pointerup", onUp);
-      canvas.removeEventListener("pointercancel", onUp);
-      canvas.removeEventListener("click", onClick, { capture: true });
+      cancelAnimationFrame(hoverFrame);
+      canvas.style.cursor = "";
+      source.removeEventListener("pointerdown", onDown, { capture: true });
+      source.removeEventListener("pointermove", onMove);
+      source.removeEventListener("pointermove", onHover);
+      source.removeEventListener("pointerleave", onLeave);
+      source.removeEventListener("pointerup", onUp);
+      source.removeEventListener("pointercancel", onUp);
+      source.removeEventListener("click", onClick, { capture: true });
     };
     // frameMatrix reads only refs and the stage.
     // eslint-disable-next-line react-hooks/exhaustive-deps
