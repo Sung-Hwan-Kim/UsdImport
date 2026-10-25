@@ -15,11 +15,13 @@ import { getPrimTag } from "./usd/composer";
 /** Layer used for viewport helpers so they never cast shadows or get picked. */
 export const HELPER_LAYER = 1;
 
-export type NodeKind = "stage" | "xform" | "scope" | "mesh" | "skinned" | "bone" | "light" | "camera";
+export type NodeKind = "stage" | "xform" | "scope" | "mesh" | "skinned" | "bone" | "light" | "camera" | "joint" | "physicsScene";
 
 export function nodeKind(obj: Object3D): NodeKind {
   const tag = getPrimTag(obj);
   if (tag?.typeName === "Stage") return "stage";
+  if (tag?.typeName === "PhysicsScene") return "physicsScene";
+  if (tag?.typeName.startsWith("Physics") && tag.typeName.endsWith("Joint")) return "joint";
   if ((obj as SkinnedMesh).isSkinnedMesh) return "skinned";
   if ((obj as Mesh).isMesh) return "mesh";
   if ((obj as { isBone?: boolean }).isBone) return "bone";

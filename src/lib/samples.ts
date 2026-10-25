@@ -44,6 +44,27 @@ export const SAMPLES: Sample[] = [
     description: "variants · payload · 프림 지정 reference · inactive/invisible",
   },
   {
+    id: "physics",
+    file: "physics_playground.usda",
+    title: "Physics Playground",
+    format: "USDA",
+    description: "UsdPhysics 강체 · 충돌 · 물리 머티리얼 · 볼록 껍질",
+  },
+  {
+    id: "joints",
+    file: "physics_joints.usdc",
+    title: "Physics Joints",
+    format: "USDC",
+    description: "revolute · prismatic · spherical · fixed · distance · 드라이브",
+  },
+  {
+    id: "dominoes",
+    file: "physics_dominoes_zup_cm.usd",
+    title: "Dominoes (Z-up, cm)",
+    format: "USD",
+    description: "Z-up · 센티미터 단위 물리 · 연쇄 충돌",
+  },
+  {
     id: "skinned",
     file: "skinned_tentacle.usda",
     title: "Skinned Tentacle",

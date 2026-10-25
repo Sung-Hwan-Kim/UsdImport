@@ -1,0 +1,2 @@
+newton[importers]==1.7.0
+websockets>=15,<17

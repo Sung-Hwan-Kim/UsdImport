@@ -21,9 +21,18 @@ export interface PrimTag {
   layer: string;
   /** Prim path inside that layer. */
   path: string;
+  /**
+   * Which composition of the layer built the object: 0 for the root stage, a
+   * new id per resolved reference. Relationship targets (e.g. a joint's
+   * `physics:body0`) resolve within the same instance.
+   */
+  instance: number;
   typeName: string;
   purpose?: string;
-  /** Original tag of a referenced mesh that was merged into its referencing prim. */
+  /**
+   * The referenced prim this object also stands for: a referenced mesh merged
+   * into its referencing prim, or a reference target dissolved into it.
+   */
   source?: PrimTag;
 }
 
@@ -40,6 +49,8 @@ export interface ComposeContext {
   missing: Set<string>;
   warnings: Set<string>;
   referenceCount: number;
+  /** Composer instances created so far (the root composer is instance 0). */
+  instanceCount: number;
 }
 
 function isContainer(obj: Object3D): boolean {
@@ -65,6 +76,8 @@ function findByPrimPath(root: Object3D, primPath: string): Object3D | null {
 export class ViewerComposer extends USDComposer {
   private readonly tagged = new WeakSet<Object3D>();
   private referencingSpec: USDSpec | null = null;
+  private readonly dissolvedTargets = new Map<USDSpec, PrimTag>();
+  private readonly instance: number;
 
   constructor(
     private readonly ctx: ComposeContext,
@@ -73,6 +86,7 @@ export class ViewerComposer extends USDComposer {
     manager: LoadingManager | null = null,
   ) {
     super(manager);
+    this.instance = ctx.instanceCount++;
     let cache = ctx.textureCaches.get(layerPath);
     if (!cache) {
       cache = {};
@@ -108,8 +122,14 @@ export class ViewerComposer extends USDComposer {
     if (!path) return;
     const spec = this.specsByPath[path];
     const previous = getPrimTag(obj);
-    const tag: PrimTag = { layer: this.layerPath, path, typeName: String(spec?.fields.typeName ?? "") };
+    const tag: PrimTag = {
+      layer: this.layerPath,
+      path,
+      instance: this.instance,
+      typeName: String(spec?.fields.typeName ?? ""),
+    };
     if (previous && previous.layer !== this.layerPath) tag.source = previous;
+    else if (spec && this.dissolvedTargets.has(spec)) tag.source = this.dissolvedTargets.get(spec);
 
     const visibility = this.attributeValue(path, "visibility");
     const purpose = this.attributeValue(path, "purpose");
@@ -196,6 +216,10 @@ export class ViewerComposer extends USDComposer {
     const ownTransform = this.referencingPrimHasTransform();
     if (isContainer(target) && (ownTransform || !this._hasNonIdentityTransform(target))) {
       while (target.children.length) wrapper.add(target.children[0]);
+      // The target dissolves into the referencing prim; remember it so its
+      // opinions (e.g. an asset root's RigidBodyAPI) stay reachable.
+      const targetTag = getPrimTag(target);
+      if (targetTag && this.referencingSpec) this.dissolvedTargets.set(this.referencingSpec, targetTag);
     } else {
       if (ownTransform) {
         target.position.set(0, 0, 0);

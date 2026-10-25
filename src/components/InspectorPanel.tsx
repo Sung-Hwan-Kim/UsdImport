@@ -25,6 +25,7 @@ import { SpecType, type USDSpec } from "@/lib/usd/layers";
 import { geometryCounts, texturesOf, type LoadedStage } from "@/lib/usd/loadStage";
 import { basename, formatBytes } from "@/lib/usd/paths";
 import { KIND_COLOR, KIND_ICON } from "./HierarchyPanel";
+import PhysicsInspector from "./PhysicsInspector";
 import { Badge, cn, Field, IconButton, Section } from "./ui";
 
 const FORMAT_LABEL: Record<LoadedStage["rootFormat"], string> = {
@@ -503,6 +504,7 @@ function ObjectInspector({ obj, stage }: { obj: Object3D; stage: LoadedStage }) 
       {mesh && <MaterialSection mesh={mesh} />}
       {light && <LightSection light={light} />}
       {camera && <CameraSection camera={camera} />}
+      {stage.metadata.hasPhysics && <PhysicsInspector stage={stage} obj={obj} />}
       {tag && tag.typeName !== "Stage" && <UsdSpecSection stage={stage} tag={tag} />}
     </>
   );

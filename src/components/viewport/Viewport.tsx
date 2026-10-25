@@ -8,8 +8,10 @@ import { publishRenderInfo } from "@/lib/renderInfo";
 import { HELPER_LAYER } from "@/lib/scene";
 import { useViewer } from "@/lib/store";
 import CameraRig from "./CameraRig";
+import ColliderOverlay from "./ColliderOverlay";
 import Helpers from "./Helpers";
 import Lighting from "./Lighting";
+import PhysicsRunner from "./PhysicsRunner";
 import StageModel from "./StageModel";
 
 function RendererSettings() {
@@ -86,6 +88,8 @@ export default function Viewport() {
       <RendererSettings />
       <Lighting />
       {stage && <StageModel key={stage.id} stage={stage} />}
+      {stage?.metadata.hasPhysics && <PhysicsRunner key={`physics-${stage.id}`} stage={stage} />}
+      {stage?.metadata.hasPhysics && <ColliderOverlay key={`colliders-${stage.id}`} stage={stage} />}
       <Helpers />
       <CameraRig />
       {stage && (

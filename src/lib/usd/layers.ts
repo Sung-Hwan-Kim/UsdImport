@@ -60,12 +60,13 @@ const INACTIVE_ATTR = "__viewerInactive";
 
 /**
  * Rewrites USDA syntax the three parser ignores into forms it reads:
- * plain/append `references`, list-edited `payload`, `over` prims and
- * `active = false`. The markers are resolved again in postProcessUsda().
+ * plain/append `references` and `apiSchemas`, list-edited `payload`, `over`
+ * prims and `active = false`. The markers are resolved again in postProcessUsda().
  */
 function normalizeUsdaText(text: string): string {
   return text
     .replace(/^(\s*)(?:add\s+|append\s+)?references(\s*=)/gm, "$1prepend references$2")
+    .replace(/^(\s*)(?:add\s+|append\s+)?apiSchemas(\s*=)/gm, "$1prepend apiSchemas$2")
     .replace(/^(\s*)(?:prepend|append|add)\s+payload(\s*=)/gm, "$1payload$2")
     .replace(/^(\s*)over\s+(?:(\w+)\s+)?"/gm, (_m, ws: string, type?: string) => `${ws}def ${type ?? ""}${OVER_MARK} "`)
     .replace(/^(\s*)active\s*=\s*false\s*$/gm, `$1bool ${INACTIVE_ATTR} = 1`);
@@ -88,8 +89,27 @@ function postProcessUsda(data: USDLayerData): void {
       const prim = specs[path.slice(0, -INACTIVE_ATTR.length - 1)];
       if (prim) prim.fields.active = false;
       delete specs[path];
+    } else if (path.endsWith(".apiSchemas")) {
+      // `prepend apiSchemas = [...]` is metadata, but three parses it as an attribute.
+      const prim = specs[path.slice(0, -".apiSchemas".length)];
+      if (prim) prim.fields.apiSchemas = tokenList(spec.fields.default);
+      delete specs[path];
+    } else if (spec.fields.typeName === "bool" && typeof spec.fields.default === "string") {
+      spec.fields.default = /^(1|true)$/i.test(spec.fields.default.trim());
     }
   }
+}
+
+function tokenList(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map(String);
+  if (typeof value !== "string") return [];
+  return [...value.matchAll(/"([^"]*)"|'([^']*)'/g)].map((m) => m[1] ?? m[2]);
+}
+
+/** Applied API schema names of a prim spec (`PhysicsRigidBodyAPI`, ...). */
+export function apiSchemasOf(spec: USDSpec | undefined): string[] {
+  const value = spec?.fields.apiSchemas;
+  return Array.isArray(value) ? value.map(String) : [];
 }
 
 function readUsdaHeader(text: string): { subLayers: string[]; metadata: Record<string, unknown> } {

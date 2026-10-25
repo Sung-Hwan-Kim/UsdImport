@@ -3,6 +3,7 @@ import { unzipSync } from "three/examples/jsm/libs/fflate.module.js";
 import { ViewerComposer, type ComposeContext, type PrimTag } from "./composer";
 import {
   SpecType,
+  apiSchemasOf,
   collectAssetPaths,
   detectKind,
   flattenLayerStack,
@@ -35,6 +36,8 @@ export interface StageMetadata {
   endTimeCode?: number;
   timeCodesPerSecond: number;
   documentation?: string;
+  /** Any layer applies a UsdPhysics API schema or defines a physics scene/joint. */
+  hasPhysics: boolean;
 }
 
 export interface StageStats {
@@ -226,13 +229,14 @@ export async function loadStage(source: AssetSource, requestedRoot: string, opti
     missing,
     warnings,
     referenceCount: 0,
+    instanceCount: 0,
   };
   const rootData = stacks.get(rootPath)!;
   const composer = new ViewerComposer(ctx, rootPath, [rootPath]);
   const scene = composer.compose(rootData, createAssetMap(assets, index), {}, dirname(rootPath));
   scene.name = name;
   scene.animations = [...scene.animations, ...ctx.animations];
-  scene.userData.usd = { layer: rootPath, path: "/", typeName: "Stage" } satisfies PrimTag;
+  scene.userData.usd = { layer: rootPath, path: "/", instance: 0, typeName: "Stage" } satisfies PrimTag;
   const composeTime = performance.now() - tCompose;
 
   const tTextures = performance.now();
@@ -253,6 +257,7 @@ export async function loadStage(source: AssetSource, requestedRoot: string, opti
     endTimeCode: num(rootFields.endTimeCode),
     timeCodesPerSecond: num(rootFields.timeCodesPerSecond) ?? num(rootFields.framesPerSecond) ?? 24,
     documentation: typeof rootFields.documentation === "string" && rootFields.documentation ? rootFields.documentation : undefined,
+    hasPhysics: [...stacks.values()].some(hasPhysicsSpecs),
   };
 
   let prims = 0;
@@ -276,6 +281,16 @@ export async function loadStage(source: AssetSource, requestedRoot: string, opti
     stats: { ...computeStats(scene), prims, references: ctx.referenceCount },
     timings: { parse: parseTime, compose: composeTime, textures: textureTime, total: performance.now() - t0 },
   };
+}
+
+function hasPhysicsSpecs(data: USDLayerData): boolean {
+  for (const path in data.specsByPath) {
+    const spec = data.specsByPath[path];
+    if (spec.specType !== SpecType.Prim) continue;
+    if (String(spec.fields.typeName ?? "").startsWith("Physics")) return true;
+    if (apiSchemasOf(spec).some((s) => s.startsWith("Physics"))) return true;
+  }
+  return false;
 }
 
 function materialsOf(mesh: Mesh): Material[] {

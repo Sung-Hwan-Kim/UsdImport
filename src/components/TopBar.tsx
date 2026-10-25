@@ -66,6 +66,7 @@ const SHORTCUTS: [string, string][] = [
   ["1 – 4", "PBR · Clay · Normals · Wireframe"],
   ["G / L / R", "그리드 · USD 라이트 · 자동 회전"],
   ["Space", "애니메이션 재생/정지"],
+  ["P / Shift+R", "물리 재생·일시정지 / 리셋"],
   ["↑ ↓ ← →", "계층 트리 탐색"],
 ];
 

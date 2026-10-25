@@ -9,6 +9,7 @@ import AnimationBar from "./AnimationBar";
 import HierarchyPanel from "./HierarchyPanel";
 import InspectorPanel from "./InspectorPanel";
 import { DropOverlay, EmptyState, ErrorToast, LoadingOverlay, RenderStatsOverlay } from "./Overlays";
+import PhysicsBar from "./PhysicsBar";
 import TopBar from "./TopBar";
 import { cn } from "./ui";
 import Viewport from "./viewport/Viewport";
@@ -94,7 +95,12 @@ function useShortcuts() {
           toggle("sceneLights");
           break;
         case "KeyR":
-          toggle("autoRotate");
+          if (e.shiftKey) {
+            if (s.physics.status !== "off") s.physicsCommand("reset");
+          } else toggle("autoRotate");
+          break;
+        case "KeyP":
+          if (s.stage?.metadata.hasPhysics) s.physicsCommand(s.physics.status === "running" ? "pause" : "play");
           break;
         case "Space":
           if (s.animation.duration > 0) {
@@ -157,6 +163,7 @@ export default function ViewerApp() {
           {stage && <ViewportToolbar />}
           {!stage && !loading && <EmptyState />}
           {stage && hasAnimation && <AnimationBar />}
+          {stage?.metadata.hasPhysics && <PhysicsBar raised={hasAnimation} />}
           {showStats && stage && <RenderStatsOverlay />}
           {loading && <LoadingOverlay />}
           <ErrorToast />

@@ -11,7 +11,7 @@ import random
 import sys
 
 from PIL import Image, ImageDraw, ImageFilter
-from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdShade, UsdSkel, UsdUtils, Vt
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade, UsdSkel, UsdUtils, Vt
 
 OUT = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else "public/samples")
 
@@ -606,6 +606,326 @@ def sample_composition():
     return path
 
 
+# ---------------------------------------------------------------- physics
+
+
+def physics_scene(stage, path, direction, magnitude):
+    scene = UsdPhysics.Scene.Define(stage, path)
+    scene.CreateGravityDirectionAttr(Gf.Vec3f(*direction))
+    scene.CreateGravityMagnitudeAttr(magnitude)
+    return scene
+
+
+def physics_material(stage, path, static_friction, dynamic_friction, restitution, density=None):
+    mat = UsdShade.Material.Define(stage, path)
+    api = UsdPhysics.MaterialAPI.Apply(mat.GetPrim())
+    api.CreateStaticFrictionAttr(static_friction)
+    api.CreateDynamicFrictionAttr(dynamic_friction)
+    api.CreateRestitutionAttr(restitution)
+    if density is not None:
+        api.CreateDensityAttr(density)
+    return mat
+
+
+def bind_physics(prim, mat):
+    prim = prim.GetPrim() if hasattr(prim, "GetPrim") else prim
+    UsdShade.MaterialBindingAPI.Apply(prim).Bind(mat, UsdShade.Tokens.weakerThanDescendants, "physics")
+
+
+def rigid(prim, mass=None, density=None, velocity=None, angular=None):
+    prim = prim.GetPrim() if hasattr(prim, "GetPrim") else prim
+    body = UsdPhysics.RigidBodyAPI.Apply(prim)
+    if velocity:
+        body.CreateVelocityAttr(Gf.Vec3f(*velocity))
+    if angular:
+        body.CreateAngularVelocityAttr(Gf.Vec3f(*angular))
+    UsdPhysics.CollisionAPI.Apply(prim)
+    if mass is not None or density is not None:
+        api = UsdPhysics.MassAPI.Apply(prim)
+        if mass is not None:
+            api.CreateMassAttr(mass)
+        if density is not None:
+            api.CreateDensityAttr(density)
+    return prim
+
+
+def collider(prim, approximation=None):
+    prim = prim.GetPrim() if hasattr(prim, "GetPrim") else prim
+    UsdPhysics.CollisionAPI.Apply(prim)
+    if approximation:
+        UsdPhysics.MeshCollisionAPI.Apply(prim).CreateApproximationAttr(approximation)
+    return prim
+
+
+def box(stage, path, size, pos, mat=None, rot_y=None):
+    cube = UsdGeom.Cube.Define(stage, path)
+    cube.CreateSizeAttr(1.0)
+    cube.AddTranslateOp().Set(Gf.Vec3d(*pos))
+    if rot_y is not None:
+        cube.AddRotateYOp().Set(rot_y)
+    cube.AddScaleOp().Set(Gf.Vec3f(*size))
+    if mat:
+        bind(cube, mat)
+    return cube
+
+
+def sphere(stage, path, radius, pos, mat=None):
+    s = UsdGeom.Sphere.Define(stage, path)
+    s.CreateRadiusAttr(radius)
+    s.AddTranslateOp().Set(Gf.Vec3d(*pos))
+    if mat:
+        bind(s, mat)
+    return s
+
+
+def joint_frames(joint, anchor, body0_pos, body1_pos, scale0=1.0, scale1=1.0):
+    """Joint frames at a world anchor for unrotated bodies (body0_pos None = world).
+
+    localPos is expressed in the body's local space, so it is divided by the body's (uniform) scale.
+    """
+    a = Gf.Vec3f(*anchor)
+    joint.CreateLocalPos0Attr(a if body0_pos is None else (a - Gf.Vec3f(*body0_pos)) / scale0)
+    joint.CreateLocalPos1Attr((a - Gf.Vec3f(*body1_pos)) / scale1)
+    joint.CreateLocalRot0Attr(Gf.Quatf(1, 0, 0, 0))
+    joint.CreateLocalRot1Attr(Gf.Quatf(1, 0, 0, 0))
+
+
+def sample_physics_playground():
+    """ASCII .usda: rigid bodies, static colliders, physics materials, convex hull mesh, initial velocity."""
+    path = os.path.join(OUT, "physics_playground.usda")
+    stage = Usd.Stage.CreateNew(path)
+    UsdGeom.Xform.Define(stage, "/World")
+    physics_scene(stage, "/World/PhysicsScene", (0, -1, 0), 9.81)
+    looks = "/World/Looks"
+    concrete = make_material(stage, looks + "/Concrete", (0.55, 0.56, 0.58), 0.0, 0.85)
+    crate = make_material(stage, looks + "/Crate", texture="./props/textures/wood.png", roughness=0.6)
+    rubber = make_material(stage, looks + "/RedRubber", (0.85, 0.12, 0.1), 0.0, 0.5)
+    ice = make_material(stage, looks + "/Ice", (0.7, 0.85, 0.95), 0.0, 0.08)
+    steel = make_material(stage, looks + "/Steel", (0.75, 0.76, 0.78), 1.0, 0.3)
+    teal = make_material(stage, looks + "/Teal", (0.1, 0.6, 0.6), 0.0, 0.35)
+
+    bouncy = physics_material(stage, "/World/PhysicsMaterials/Bouncy", 0.6, 0.5, 0.85)
+    slippery = physics_material(stage, "/World/PhysicsMaterials/Slippery", 0.03, 0.02, 0.0)
+    wood = physics_material(stage, "/World/PhysicsMaterials/Wood", 0.6, 0.5, 0.1, density=600)
+
+    ground = box(stage, "/World/Ground", (14, 0.2, 10), (0, -0.1, 0), concrete)
+    collider(ground)
+
+    # Box pyramid.
+    stack = UsdGeom.Xform.Define(stage, "/World/Stack")
+    s = 0.5
+    n = 0
+    for row in range(4):
+        for i in range(4 - row):
+            x = -4.0 + (i - (3 - row) / 2) * (s + 0.01)
+            b = box(stage, f"/World/Stack/Crate_{n:02d}", (s, s, s), (x, s / 2 + row * (s + 0.002), -1.0), crate)
+            rigid(b)
+            bind_physics(b, wood)
+            n += 1
+
+    # Bouncy balls dropped from different heights.
+    for i, h in enumerate((2.0, 3.0, 4.0)):
+        ball = sphere(stage, f"/World/Ball_{i + 1}", 0.25, (-1.0 + i * 0.8, h, 1.5), rubber)
+        rigid(ball, mass=0.5)
+        bind_physics(ball, bouncy)
+
+    # Low-friction ramp with a block sliding down.
+    ramp = box(stage, "/World/Ramp", (4, 0.15, 1.5), (2.5, 1.0, -1.5), ice)
+    ramp.AddRotateZOp().Set(-20.0)  # appended after scale: rotates the scaled box in its parent frame
+    ramp.SetXformOpOrder([ramp.GetOrderedXformOps()[0], ramp.GetOrderedXformOps()[2], ramp.GetOrderedXformOps()[1]])
+    collider(ramp)
+    bind_physics(ramp, slippery)
+    tilt = math.radians(-20.0)
+    along, normal = (math.cos(tilt), math.sin(tilt)), (-math.sin(tilt), math.cos(tilt))
+    block_pos = (2.5 - 1.5 * along[0] + 0.23 * normal[0], 1.0 - 1.5 * along[1] + 0.23 * normal[1], -1.5)
+    slider = box(stage, "/World/IceBlock", (0.4, 0.3, 0.4), block_pos, ice)
+    slider.AddRotateZOp().Set(-20.0)
+    slider.SetXformOpOrder([slider.GetOrderedXformOps()[0], slider.GetOrderedXformOps()[2], slider.GetOrderedXformOps()[1]])
+    rigid(slider, mass=1.0)
+    bind_physics(slider, slippery)
+
+    # Convex-hull mesh (a vase) tipping over, and a thrown capsule.
+    vase, _ = lathe(stage, "/World/Vase", [[(0.0, 0.0), (0.18, 0.0)], [(0.18, 0.0), (0.3, 0.35), (0.22, 0.7), (0.12, 0.9), (0.15, 1.0)]], segments=24)
+    # Lifted so the tilted base starts just above the ground instead of inside it.
+    vase.AddTranslateOp().Set(Gf.Vec3d(3.0, 0.06, 1.5))
+    vase.AddRotateZOp().Set(12.0)
+    bind(vase, teal)
+    rigid(vase, mass=2.0)
+    collider(vase, "convexHull")
+
+    cap = UsdGeom.Capsule.Define(stage, "/World/ThrownCapsule")
+    cap.CreateRadiusAttr(0.15)
+    cap.CreateHeightAttr(0.5)
+    cap.CreateAxisAttr("X")
+    cap.AddTranslateOp().Set(Gf.Vec3d(-5.5, 1.0, 1.5))
+    bind(cap, steel)
+    rigid(cap, mass=1.0, velocity=(4.0, 5.0, 0.0), angular=(0.0, 0.0, 360.0))
+
+    set_stage_meta(stage, "Y", 1.0, "/World")
+    stage.GetRootLayer().Save()
+    return path
+
+
+def sample_physics_joints():
+    """Binary .usdc: revolute chain, motor drive, prismatic limits+drive, spherical cone, fixed, distance joints."""
+    path = os.path.join(OUT, "physics_joints.usdc")
+    stage = Usd.Stage.CreateNew(path)
+    UsdGeom.Xform.Define(stage, "/World")
+    physics_scene(stage, "/World/PhysicsScene", (0, -1, 0), 9.81)
+    looks = "/World/Looks"
+    dark = make_material(stage, looks + "/Dark", (0.12, 0.13, 0.15), 0.0, 0.6)
+    orange = make_material(stage, looks + "/Orange", (0.95, 0.45, 0.1), 0.0, 0.4)
+    blue = make_material(stage, looks + "/Blue", (0.15, 0.4, 0.9), 0.0, 0.35)
+    green = make_material(stage, looks + "/Green", (0.2, 0.7, 0.35), 0.0, 0.4)
+    gold = make_material(stage, looks + "/Gold", (1.0, 0.77, 0.34), 1.0, 0.25)
+    floor = make_material(stage, looks + "/Floor", (0.5, 0.52, 0.55), 0.0, 0.9)
+
+    ground = box(stage, "/World/Ground", (14, 0.2, 8), (0, -0.1, 0), floor)
+    collider(ground)
+    joints = UsdGeom.Scope.Define(stage, "/World/Joints")
+
+    # Revolute pendulum chain hanging from a static anchor, starting horizontal.
+    anchor = (-4.5, 4.0, 0.0)
+    a = box(stage, "/World/Chain/Anchor", (0.25, 0.25, 0.25), anchor, dark)
+    collider(a)
+    prev_path, prev_pos = "/World/Chain/Anchor", anchor
+    link_len = 0.8
+    for i in range(4):
+        center = (anchor[0] + link_len * (i + 0.5), anchor[1], anchor[2])
+        cap = UsdGeom.Capsule.Define(stage, f"/World/Chain/Link_{i + 1}")
+        cap.CreateRadiusAttr(0.09)
+        cap.CreateHeightAttr(link_len - 0.2)
+        cap.CreateAxisAttr("X")
+        cap.AddTranslateOp().Set(Gf.Vec3d(*center))
+        bind(cap, orange)
+        rigid(cap, mass=0.5)
+        j = UsdPhysics.RevoluteJoint.Define(stage, f"/World/Joints/ChainHinge_{i + 1}")
+        j.CreateBody0Rel().SetTargets([prev_path])
+        j.CreateBody1Rel().SetTargets([cap.GetPath()])
+        j.CreateAxisAttr("Z")
+        joint_frames(j, (anchor[0] + link_len * i, anchor[1], anchor[2]), prev_pos, center)
+        prev_path, prev_pos = cap.GetPath(), center
+
+    # Motor: a paddle driven at constant angular velocity about X, anchored to the world.
+    pivot = (-1.0, 1.4, 0.0)
+    paddle = box(stage, "/World/Motor/Paddle", (0.12, 1.8, 0.25), pivot, blue)
+    rigid(paddle, mass=2.0)
+    m = UsdPhysics.RevoluteJoint.Define(stage, "/World/Joints/MotorHinge")
+    m.CreateBody1Rel().SetTargets([paddle.GetPath()])
+    m.CreateAxisAttr("X")
+    joint_frames(m, pivot, None, pivot)
+    drive = UsdPhysics.DriveAPI.Apply(m.GetPrim(), "angular")
+    drive.CreateTypeAttr("force")
+    drive.CreateTargetVelocityAttr(120.0)
+    drive.CreateStiffnessAttr(0.0)
+    drive.CreateDampingAttr(1000.0)
+    drive.CreateMaxForceAttr(1.0e6)
+
+    # Prismatic slider along X with limits and a position drive.
+    rail_y = 0.6
+    UsdGeom.Xform.Define(stage, "/World/Slider")
+    rail = box(stage, "/World/Slider/Rail", (2.4, 0.05, 0.05), (1.5, rail_y, 0.0), dark)
+    cart = box(stage, "/World/Slider/Cart", (0.4, 0.3, 0.3), (0.5, rail_y, 0.0), green)
+    rigid(cart, mass=1.0)
+    p = UsdPhysics.PrismaticJoint.Define(stage, "/World/Joints/SliderTrack")
+    p.CreateBody1Rel().SetTargets([cart.GetPath()])
+    p.CreateAxisAttr("X")
+    p.CreateLowerLimitAttr(-0.2)
+    p.CreateUpperLimitAttr(1.8)
+    joint_frames(p, (0.5, rail_y, 0.0), None, (0.5, rail_y, 0.0))
+    pdrive = UsdPhysics.DriveAPI.Apply(p.GetPrim(), "linear")
+    pdrive.CreateTypeAttr("force")
+    pdrive.CreateTargetPositionAttr(1.5)
+    pdrive.CreateStiffnessAttr(40.0)
+    pdrive.CreateDampingAttr(4.0)
+    del rail
+
+    # Spherical joint with a cone limit, given a sideways push.
+    s_anchor = (3.5, 3.5, 0.0)
+    bob = sphere(stage, "/World/Spherical/Bob", 0.25, (3.5, 2.0, 0.0), gold)
+    rigid(bob, mass=1.0, velocity=(0.0, 0.0, 3.0))
+    sj = UsdPhysics.SphericalJoint.Define(stage, "/World/Joints/BallSocket")
+    sj.CreateBody1Rel().SetTargets([bob.GetPath()])
+    sj.CreateAxisAttr("Y")
+    sj.CreateConeAngle0LimitAttr(40.0)
+    sj.CreateConeAngle1LimitAttr(40.0)
+    joint_frames(sj, s_anchor, None, (3.5, 2.0, 0.0))
+    box(stage, "/World/Spherical/Mount", (0.2, 0.2, 0.2), s_anchor, dark)
+
+    # Fixed joint: two welded crates falling as one.
+    w1 = box(stage, "/World/Welded/CrateA", (0.5, 0.5, 0.5), (-2.0, 2.5, 2.0), orange)
+    w2 = box(stage, "/World/Welded/CrateB", (0.5, 0.5, 0.5), (-1.55, 2.95, 2.0), blue)
+    rigid(w1, mass=1.0, angular=(0.0, 0.0, 90.0))
+    rigid(w2, mass=1.0)
+    f = UsdPhysics.FixedJoint.Define(stage, "/World/Joints/Weld")
+    f.CreateBody0Rel().SetTargets([w1.GetPath()])
+    f.CreateBody1Rel().SetTargets([w2.GetPath()])
+    joint_frames(f, (-1.775, 2.725, 2.0), (-2.0, 2.5, 2.0), (-1.55, 2.95, 2.0), 0.5, 0.5)
+
+    # Distance joint: a weight on a 1.4 m rope, released sideways.
+    rope_anchor = (1.5, 3.8, 2.0)
+    weight = sphere(stage, "/World/Rope/Weight", 0.2, (2.5, 3.8, 2.0), green)
+    rigid(weight, mass=1.0)
+    d = UsdPhysics.DistanceJoint.Define(stage, "/World/Joints/Rope")
+    d.CreateBody1Rel().SetTargets([weight.GetPath()])
+    d.CreateMinDistanceAttr(0.0)
+    d.CreateMaxDistanceAttr(1.4)
+    d.CreateLocalPos0Attr(Gf.Vec3f(*rope_anchor))
+    d.CreateLocalPos1Attr(Gf.Vec3f(0, 0, 0))
+    box(stage, "/World/Rope/Hook", (0.15, 0.15, 0.15), rope_anchor, dark)
+    del joints
+
+    set_stage_meta(stage, "Y", 1.0, "/World")
+    stage.GetRootLayer().Save()
+    return path
+
+
+def sample_physics_dominoes():
+    """Crate-encoded .usd, Z-up and centimetres: dominoes along an arc knocked over by a rolling ball."""
+    path = os.path.join(OUT, "physics_dominoes_zup_cm.usd")
+    stage = Usd.Stage.CreateNew(path)
+    UsdGeom.Xform.Define(stage, "/Dominoes")
+    physics_scene(stage, "/Dominoes/PhysicsScene", (0, 0, -1), 981.0)
+    looks = "/Dominoes/Looks"
+    ivory = make_material(stage, looks + "/Ivory", (0.93, 0.9, 0.82), 0.0, 0.3)
+    ebony = make_material(stage, looks + "/Ebony", (0.08, 0.08, 0.09), 0.0, 0.25)
+    table = make_material(stage, looks + "/Table", texture="./props/textures/wood.png", roughness=0.5)
+    steel = make_material(stage, looks + "/Steel", (0.8, 0.8, 0.82), 1.0, 0.2)
+    felt = physics_material(stage, "/Dominoes/PhysicsMaterials/Felt", 0.5, 0.4, 0.05)
+
+    top = UsdGeom.Cube.Define(stage, "/Dominoes/Table")
+    top.CreateSizeAttr(1.0)
+    top.AddTranslateOp().Set(Gf.Vec3d(0, 0, -2.5))
+    top.AddScaleOp().Set(Gf.Vec3f(320, 200, 5))
+    bind(top, table)
+    collider(top)
+    bind_physics(top, felt)
+
+    count, radius = 22, 90.0
+    for i in range(count):
+        ang = math.radians(-70 + 140 * i / (count - 1))
+        x, y = radius * math.sin(ang), radius * (1 - math.cos(ang)) - 40
+        d = UsdGeom.Cube.Define(stage, f"/Dominoes/Domino_{i:02d}")
+        d.CreateSizeAttr(1.0)
+        d.AddTranslateOp().Set(Gf.Vec3d(x, y, 8.0))
+        d.AddRotateZOp().Set(math.degrees(ang))
+        d.AddScaleOp().Set(Gf.Vec3f(1.6, 8.0, 16.0))
+        bind(d, ivory if i % 2 == 0 else ebony)
+        rigid(d, mass=0.06)
+        bind_physics(d, felt)
+
+    # Roll the ball along the arc's tangent into the first domino.
+    first = math.radians(-70)
+    tx, ty = math.cos(first), math.sin(first)
+    x0, y0 = radius * math.sin(first), radius * (1 - math.cos(first)) - 40
+    ball = sphere(stage, "/Dominoes/Ball", 4.0, (x0 - 25 * tx, y0 - 25 * ty, 4.0), steel)
+    rigid(ball, mass=0.4, velocity=(160.0 * tx, 160.0 * ty, 0.0))
+
+    set_stage_meta(stage, "Z", 0.01, "/Dominoes")
+    stage.GetRootLayer().Save()
+    return path
+
+
 def main():
     os.makedirs(os.path.join(OUT, "textures"), exist_ok=True)
     os.makedirs(os.path.join(OUT, "props", "textures"), exist_ok=True)
@@ -616,7 +936,17 @@ def main():
     write_tiles(os.path.join(OUT, "textures", "tiles.png"))
     write_wood(os.path.join(OUT, "props", "textures", "wood.png"))
 
-    outputs = [sample_primitives(), sample_vases(), sample_assembly(), sample_sublayers(), sample_skinned(), sample_composition()]
+    outputs = [
+        sample_primitives(),
+        sample_vases(),
+        sample_assembly(),
+        sample_sublayers(),
+        sample_skinned(),
+        sample_composition(),
+        sample_physics_playground(),
+        sample_physics_joints(),
+        sample_physics_dominoes(),
+    ]
 
     usdz = os.path.join(OUT, "kitchen_packaged.usdz")
     UsdUtils.CreateNewUsdzPackage(Sdf.AssetPath(os.path.join(OUT, "kitchen_assembly.usd")), usdz)

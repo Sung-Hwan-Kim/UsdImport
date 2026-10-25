@@ -27,3 +27,7 @@ __pycache__/
 
 # local tool config
 .claude/
+
+# physics: wasm copied from node_modules on install, Newton server venv
+/public/physx/
+/.venv-newton/

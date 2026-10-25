@@ -1,6 +1,7 @@
 "use client";
 
 import {
+  Atom,
   Axis3d,
   Bone,
   Box,
@@ -11,6 +12,7 @@ import {
   Folder,
   Layers,
   Lightbulb,
+  Link2,
   PersonStanding,
   Search,
   Video,
@@ -35,6 +37,8 @@ export const KIND_ICON: Record<NodeKind, LucideIcon> = {
   bone: Bone,
   light: Lightbulb,
   camera: Video,
+  joint: Link2,
+  physicsScene: Atom,
 };
 
 export const KIND_COLOR: Record<NodeKind, string> = {
@@ -46,6 +50,8 @@ export const KIND_COLOR: Record<NodeKind, string> = {
   bone: "text-faint",
   light: "text-warn",
   camera: "text-ok",
+  joint: "text-[#ff9f5a]",
+  physicsScene: "text-accent",
 };
 
 interface Row {

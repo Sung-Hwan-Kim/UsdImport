@@ -2,6 +2,8 @@ import type { Object3D } from "three";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import { filesFromInput, labelForFiles, rankRootCandidates } from "./files";
+import type { EngineKind } from "./physics/engine";
+import type { PhysicsDescription } from "./physics/schema";
 import type { Shading } from "./scene";
 import { disposeStage, loadStage, type LoadedStage } from "./usd/loadStage";
 import { FileSource, sourceFromUrl, type AssetSource, type LocalFile } from "./usd/sources";
@@ -35,6 +37,25 @@ export interface ViewSettings {
   autoRotate: boolean;
   upAxis: UpAxisMode;
   stats: boolean;
+  physicsEngine: EngineKind;
+  newtonUrl: string;
+  showColliders: boolean;
+}
+
+export type PhysicsStatus = "off" | "loading" | "running" | "paused" | "error";
+export type PhysicsCommand = "play" | "pause" | "step" | "reset" | "stop";
+
+/** Simulation state; the engine itself lives in the viewport's PhysicsRunner. */
+export interface PhysicsState {
+  status: PhysicsStatus;
+  time: number;
+  speed: number;
+  /** e.g. "PhysX 5.11 · WASM", once loaded */
+  label: string | null;
+  message: string | null;
+  warnings: string[];
+  description: PhysicsDescription | null;
+  command: { type: PhysicsCommand; nonce: number };
 }
 
 export interface StageBounds {
@@ -71,6 +92,7 @@ interface ViewerState {
   focus: { target: "stage" | "selection"; reset: boolean; nonce: number };
   settings: ViewSettings;
   animation: AnimationState;
+  physics: PhysicsState;
   panels: { hierarchy: boolean; inspector: boolean };
   canvas: HTMLCanvasElement | null;
 
@@ -86,6 +108,9 @@ interface ViewerState {
   setVisible(obj: Object3D, visible: boolean): void;
   showAll(): void;
   setAnimation(patch: Partial<AnimationState>): void;
+  setPhysics(patch: Partial<Omit<PhysicsState, "command">>): void;
+  /** Queue a command for the PhysicsRunner (play also loads the engine on first use). */
+  physicsCommand(type: PhysicsCommand): void;
   togglePanel(panel: "hierarchy" | "inspector"): void;
   setCanvas(canvas: HTMLCanvasElement | null): void;
   clearError(): void;
@@ -104,6 +129,20 @@ const DEFAULT_SETTINGS: ViewSettings = {
   autoRotate: false,
   upAxis: "auto",
   stats: false,
+  physicsEngine: "physx",
+  newtonUrl: "ws://127.0.0.1:8765",
+  showColliders: false,
+};
+
+const INITIAL_PHYSICS: PhysicsState = {
+  status: "off",
+  time: 0,
+  speed: 1,
+  label: null,
+  message: null,
+  warnings: [],
+  description: null,
+  command: { type: "stop", nonce: 0 },
 };
 
 let loadToken = 0;
@@ -126,6 +165,7 @@ export const useViewer = create<ViewerState>()(
       focus: { target: "stage", reset: true, nonce: 0 },
       settings: DEFAULT_SETTINGS,
       animation: { playing: false, time: 0, duration: 0, speed: 1, loop: true },
+      physics: INITIAL_PHYSICS,
       panels: { hierarchy: true, inspector: true },
       canvas: null,
 
@@ -150,6 +190,8 @@ export const useViewer = create<ViewerState>()(
             bounds: null,
             session: { source, rootPath, candidates },
             animation: { ...s.animation, playing: duration > 0, time: 0, duration },
+            // The previous stage's runner disposes its engine when it unmounts.
+            physics: { ...INITIAL_PHYSICS, speed: s.physics.speed, command: s.physics.command },
             focus: { target: "stage", reset: true, nonce: s.focus.nonce + 1 },
           }));
           // Free GPU resources once the old scene has left the render tree.
@@ -219,6 +261,14 @@ export const useViewer = create<ViewerState>()(
 
       setAnimation(patch) {
         set((s) => ({ animation: { ...s.animation, ...patch } }));
+      },
+
+      setPhysics(patch) {
+        set((s) => ({ physics: { ...s.physics, ...patch } }));
+      },
+
+      physicsCommand(type) {
+        set((s) => ({ physics: { ...s.physics, command: { type, nonce: s.physics.command.nonce + 1 } } }));
       },
 
       togglePanel(panel) {

@@ -3,9 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "postinstall": "node scripts/copy-physx-wasm.mjs",
+    "predev": "node scripts/copy-physx-wasm.mjs",
     "dev": "next dev",
+    "prebuild": "node scripts/copy-physx-wasm.mjs",
     "build": "next build",
     "start": "next start",
+    "newton:setup": "node scripts/newton.mjs setup",
+    "newton": "node scripts/newton.mjs serve",
     "lint": "eslint"
   },
   "dependencies": {
@@ -13,6 +18,7 @@
     "@react-three/fiber": "^9.8.2",
     "lucide-react": "^1.61.0",
     "next": "^16.4.2",
+    "physx-js-webidl": "2.8.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "three": "0.186.1",
