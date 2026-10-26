@@ -11,6 +11,7 @@ import { authoredAttribute, extractPhysics } from "@/lib/physics/schema";
 import { isShownInHierarchy, stagePathOf } from "@/lib/scene";
 import { getPrimTag } from "@/lib/usd/composer";
 import type { PrimEdit } from "@/lib/usd/sdf/edits";
+import { poseStageAt, timelineStart } from "@/lib/usd/stageAnimation";
 import { setSimulationEditsProvider } from "@/lib/usd/stageEdits";
 import { useViewer, type PhysicsCommand } from "@/lib/store";
 import type { LoadedStage } from "@/lib/usd/loadStage";
@@ -100,12 +101,27 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
     }
   };
 
-  const feedKinematic = (s: Session) => {
+  /** Kinematic bodies take their animated pose at simulation time `time` as the next step's target. */
+  const feedKinematic = (s: Session, time: number) => {
+    if (!s.result.kinematic.includes(true)) return;
+    poseStageAt(stage, timelineStart(stage) + time);
     for (let i = 0; i < s.result.bodies.length; i++) {
       if (!s.result.kinematic[i]) continue;
-      frameMatrix(s, s.result.bodies[i], tmpMatrix).decompose(tmpPosition, tmpQuaternion, tmpScale);
+      const obj = s.result.bodies[i];
+      obj.updateWorldMatrix(true, false);
+      frameMatrix(s, obj, tmpMatrix).decompose(tmpPosition, tmpQuaternion, tmpScale);
       s.engine.setKinematicPose(i, tmpPosition, tmpQuaternion);
     }
+  };
+
+  /**
+   * The simulation clock drives the animation timeline, as Isaac Sim's Play
+   * does: simulation time 0 is the stage's start time code.
+   */
+  const syncTimeline = (time: number) => {
+    const { animation, setAnimation } = useViewer.getState();
+    const t = timelineStart(stage) + time;
+    if (animation.duration > 0 && (animation.time !== t || animation.playing)) setAnimation({ time: t, playing: false });
   };
 
   const restore = (s: Session) => {
@@ -116,6 +132,8 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
       obj.quaternion.copy(t.quaternion);
       obj.scale.copy(t.scale);
     });
+    // Animated prims (kinematic bodies among them) follow the timeline again.
+    if (!disposed.current) poseStageAt(stage, useViewer.getState().animation.time);
     stage.scene.updateMatrixWorld(true);
   };
 
@@ -151,6 +169,9 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
     setPhysics({ status: "loading", message: null, warnings: [] });
     const promise = (async () => {
       try {
+        // Simulations start from the stage's start time code, with animated prims posed there.
+        syncTimeline(0);
+        poseStageAt(stage, timelineStart(stage));
         stage.scene.updateMatrixWorld(true);
         const description = extractPhysics(stage);
         const hasCloth = description.deformables.some((d) => d.kind === "surface");
@@ -233,10 +254,11 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
         s.engine.setRunning(false);
         if (s.engine.remote) s.engine.stepFrame();
         else {
-          feedKinematic(s);
+          feedKinematic(s, s.engine.time() + s.result.dt);
           s.engine.advance();
         }
         applyPoses(s);
+        syncTimeline(s.engine.time());
         setPhysics({ status: "paused", time: s.engine.time() });
         break;
       }
@@ -244,6 +266,7 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
         const s = session.current;
         if (!s) return;
         s.engine.setRunning(false);
+        syncTimeline(0);
         restore(s);
         await s.engine.reset();
         s.accumulator = 0;
@@ -459,7 +482,7 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
       s.accumulator += Math.min(delta, 0.1) * physics.speed;
       let steps = 0;
       while (s.accumulator >= s.result.dt && steps < MAX_STEPS_PER_FRAME) {
-        feedKinematic(s);
+        feedKinematic(s, s.engine.time() + s.result.dt);
         s.engine.advance();
         s.accumulator -= s.result.dt;
         steps++;
@@ -468,6 +491,7 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
     }
     applyPoses(s);
     const time = s.engine.time();
+    if (physics.status === "running" || physics.status === "paused") syncTimeline(time);
     if (physics.status === "running" && time !== physics.time) useViewer.getState().setPhysics({ time });
   });
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import shutil
 import tempfile
 import traceback
@@ -106,6 +107,25 @@ def pull_particles(
 
 
 @wp.kernel
+def pose_kinematic(
+    bodies: wp.array(dtype=int),
+    start: wp.array(dtype=wp.transform),
+    end: wp.array(dtype=wp.transform),
+    velocity: wp.array(dtype=wp.spatial_vector),
+    alpha: float,
+    body_q: wp.array(dtype=wp.transform),
+    body_qd: wp.array(dtype=wp.spatial_vector),
+):
+    """Move animated kinematic bodies `alpha` of the way through this frame (solvers pass them through unchanged)."""
+    i = wp.tid()
+    b = bodies[i]
+    p = wp.lerp(wp.transform_get_translation(start[i]), wp.transform_get_translation(end[i]), alpha)
+    q = wp.quat_slerp(wp.transform_get_rotation(start[i]), wp.transform_get_rotation(end[i]), alpha)
+    body_q[b] = wp.transform(p, q)
+    body_qd[b] = velocity[i]
+
+
+@wp.kernel
 def air_drag(
     drag: float,
     particle_qd: wp.array(dtype=wp.vec3),
@@ -166,6 +186,104 @@ def anchor_static_joints(stage: Usd.Stage) -> list[tuple[str, str]]:
     return pairs
 
 
+GENERIC_JOINT_DOFS = ("transX", "transY", "transZ", "rotX", "rotY", "rotZ")
+
+
+def free_unlimited_generic_axes(stage: Usd.Stage) -> None:
+    """Give generic joints an unbounded limit on every DOF without a LimitAPI.
+
+    In UsdPhysics such a DOF is free (Isaac Sim drives it, e.g. a body moved
+    along time-sampled drive targets). Newton 1.7 only adds D6 axes for DOFs
+    with a limit, so it would weld these joints instead.
+    """
+    stage.SetEditTarget(stage.GetSessionLayer())
+    for prim in stage.Traverse():
+        if prim.GetTypeName() != "PhysicsJoint":
+            continue
+        for dof in GENERIC_JOINT_DOFS:
+            if prim.HasAPI(UsdPhysics.LimitAPI, dof):
+                continue
+            limit = UsdPhysics.LimitAPI.Apply(prim, dof)
+            limit.CreateLowAttr(-math.inf)
+            limit.CreateHighAttr(math.inf)
+
+
+def _sampled(attr: Usd.Attribute) -> tuple[np.ndarray, np.ndarray] | None:
+    """An attribute's time samples as (time codes, values), when it has more than a default."""
+    if not attr or attr.GetNumTimeSamples() == 0:
+        return None
+    times = np.array(attr.GetTimeSamples(), dtype=np.float64)
+    values = np.array([float(attr.Get(t)) for t in times], dtype=np.float64)
+    return times, values
+
+
+def animated_drive_targets(stage: Usd.Stage, builder: newton.ModelBuilder, model: newton.Model, joint_map: dict[str, int]) -> list[dict]:
+    """Time-sampled drive targets, each mapped onto its slot in Control.joint_target_q/qd.
+
+    Newton imports targets once; Isaac Sim moves drives along their samples
+    while it plays, so these are re-sampled every frame.
+    """
+    target_q_start = model.joint_target_q_start.numpy()
+    tracks = []
+    for path, j in joint_map.items():
+        prim = stage.GetPrimAtPath(path)
+        if not prim:
+            continue
+        joint_type = builder.joint_type[j]
+        lin, ang = builder.joint_dof_dim[j]
+        qd_start = builder.joint_qd_start[j]
+        names = []
+        for k in range(lin + ang):
+            if joint_type == newton.JointType.REVOLUTE:
+                names.append("angular")
+            elif joint_type == newton.JointType.PRISMATIC:
+                names.append("linear")
+            elif joint_type == newton.JointType.D6:
+                axis = np.abs(np.array(builder.joint_axis[qd_start + k], dtype=float))
+                names.append(("trans" if k < lin else "rot") + "XYZ"[int(np.argmax(axis))])
+            else:
+                names.append(None)
+        for k, name in enumerate(names):
+            if name is None:
+                continue
+            scale = math.radians(1.0) if name == "angular" or name.startswith("rot") else 1.0
+            for field, kind, index in (
+                ("targetPosition", "q", int(target_q_start[j]) + k),
+                ("targetVelocity", "qd", qd_start + k),
+            ):
+                samples = _sampled(prim.GetAttribute(f"drive:{name}:physics:{field}"))
+                if samples is not None:
+                    tracks.append({"kind": kind, "index": index, "times": samples[0], "values": samples[1] * scale})
+    return tracks
+
+
+def _is_time_varying(prim: Usd.Prim) -> bool:
+    while prim and not prim.IsPseudoRoot():
+        if prim.IsA(UsdGeom.Xformable) and UsdGeom.Xformable(prim).TransformMightBeTimeVarying():
+            return True
+        prim = prim.GetParent()
+    return False
+
+
+def _body_pose(prim: Usd.Prim, code: float) -> np.ndarray:
+    """A prim's stage-frame transform at a time code as (px, py, pz, qx, qy, qz, qw)."""
+    m = UsdGeom.XformCache(code).GetLocalToWorldTransform(prim).RemoveScaleShear()
+    p = m.ExtractTranslation()
+    q = m.ExtractRotationQuat().GetNormalized()
+    i = q.GetImaginary()
+    return np.array([p[0], p[1], p[2], i[0], i[1], i[2], q.GetReal()], dtype=np.float64)
+
+
+def _quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return np.array([aw * bx + ax * bw + ay * bz - az * by, aw * by - ax * bz + ay * bw + az * bx, aw * bz + ax * by - ay * bx + az * bw, aw * bw - ax * bx - ay * by - az * bz])
+
+
+def _rotate(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    return _quat_mul(_quat_mul(q, np.array([v[0], v[1], v[2], 0.0])), q * np.array([-1.0, -1.0, -1.0, 1.0]))[:3]
+
+
 def pin_cloth_attachments(stage: Usd.Stage, builder: newton.ModelBuilder, result: dict) -> tuple[set[str], list[str]]:
     """Pin cloth points that a PhysicsAttachment ties to a static xform (or the world).
 
@@ -220,6 +338,7 @@ class Simulation:
         gravity = (0.0, 0.0, -g) if self.up_axis == "Z" else (0.0, -g, 0.0)
         builder = newton.ModelBuilder(up_axis=up, gravity=gravity)
         anchored = anchor_static_joints(stage)
+        free_unlimited_generic_axes(stage)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             result = builder.add_usd(
@@ -263,6 +382,20 @@ class Simulation:
 
         self.bodies = list(self.model.body_label)
         self.solver_name = solver
+
+        # Isaac Sim plays the timeline with the simulation: simulation time 0 is
+        # the start time code, drive targets follow their samples and animated
+        # kinematic bodies their xforms.
+        self.stage = stage
+        self.start_code = float(stage.GetStartTimeCode())
+        self.codes_per_second = float(stage.GetTimeCodesPerSecond()) or 24.0
+        self.drive_tracks = animated_drive_targets(stage, builder, self.model, result.get("path_joint_map", {}))
+        self.kinematic = [
+            (b, stage.GetPrimAtPath(path))
+            for path, b in body_map.items()
+            if int(builder.body_flags[b]) & int(newton.BodyFlags.KINEMATIC) and _is_time_varying(stage.GetPrimAtPath(path))
+        ]
+        self.body_com = self.model.body_com.numpy() if self.model.body_count else None
         if solver == "mujoco":
             self.solver = newton.solvers.SolverMuJoCo(self.model)
         elif solver == "vbd":
@@ -294,6 +427,20 @@ class Simulation:
             self.state_1 = self.model.state()
             self.control = self.model.control()
             newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+            # Host copies of the targets; animated entries are rewritten every frame.
+            self.target_q = self.control.joint_target_q.numpy() if self.drive_tracks else None
+            self.target_qd = self.control.joint_target_qd.numpy() if self.drive_tracks else None
+            n = len(self.kinematic)
+            self.kinematic_bodies = wp.array([b for b, _ in self.kinematic] or [0], dtype=int)
+            self.kinematic_start = wp.zeros(max(n, 1), dtype=wp.transform)
+            self.kinematic_end = wp.zeros(max(n, 1), dtype=wp.transform)
+            self.kinematic_velocity = wp.zeros(max(n, 1), dtype=wp.spatial_vector)
+            if n:
+                # Start from the animated pose at the start time code.
+                body_q = self.state_0.body_q.numpy()
+                for b, prim in self.kinematic:
+                    body_q[b] = _body_pose(prim, self.start_code)
+                self.state_0.body_q.assign(body_q)
             self.initial = self.model.state()
             self.initial.assign(self.state_0)
             if self.cloths:
@@ -320,8 +467,22 @@ class Simulation:
         if self.cloths:
             # Cloth deforms a lot between frames; a rebuilt self-contact BVH stays efficient.
             self.solver.rebuild_bvh(self.state_0)
-        for _ in range(self.substeps):
+        for k in range(self.substeps):
             self.state_0.clear_forces()
+            if self.kinematic:
+                wp.launch(
+                    pose_kinematic,
+                    dim=len(self.kinematic),
+                    inputs=[
+                        self.kinematic_bodies,
+                        self.kinematic_start,
+                        self.kinematic_end,
+                        self.kinematic_velocity,
+                        (k + 1) / self.substeps,
+                    ],
+                    outputs=[self.state_0.body_q, self.state_0.body_qd],
+                    device=self.device,
+                )
             if self.model.body_count:
                 wp.launch(
                     apply_drag,
@@ -368,7 +529,38 @@ class Simulation:
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
+    def _animate(self) -> None:
+        """Drive targets for the end of the coming frame, and kinematic poses through it."""
+        start = self.start_code + self.sim_time * self.codes_per_second
+        end = self.start_code + (self.sim_time + self.frame_dt) * self.codes_per_second
+        if self.drive_tracks:
+            for track in self.drive_tracks:
+                target = self.target_q if track["kind"] == "q" else self.target_qd
+                target[track["index"]] = np.interp(end, track["times"], track["values"])
+            self.control.joint_target_q.assign(self.target_q)
+            self.control.joint_target_qd.assign(self.target_qd)
+        if self.kinematic:
+            starts = np.array([_body_pose(prim, start) for _, prim in self.kinematic])
+            ends = np.array([_body_pose(prim, end) for _, prim in self.kinematic])
+            velocities = np.zeros((len(self.kinematic), 6))
+            for i, (b, _) in enumerate(self.kinematic):
+                # body_qd: linear velocity of the centre of mass, then angular velocity (world frame).
+                com = self.body_com[b]
+                com0 = starts[i, :3] + _rotate(starts[i, 3:], com)
+                com1 = ends[i, :3] + _rotate(ends[i, 3:], com)
+                q0 = starts[i, 3:]
+                q1 = ends[i, 3:] if np.dot(starts[i, 3:], ends[i, 3:]) >= 0 else -ends[i, 3:]
+                delta = _quat_mul(q1, q0 * np.array([-1.0, -1.0, -1.0, 1.0]))
+                angle = 2.0 * math.atan2(np.linalg.norm(delta[:3]), delta[3])
+                axis = delta[:3] / (np.linalg.norm(delta[:3]) or 1.0)
+                velocities[i, :3] = (com1 - com0) / self.frame_dt
+                velocities[i, 3:] = axis * angle / self.frame_dt
+            self.kinematic_start.assign(starts.astype(np.float32))
+            self.kinematic_end.assign(ends.astype(np.float32))
+            self.kinematic_velocity.assign(velocities.astype(np.float32))
+
     def step(self) -> None:
+        self._animate()
         with wp.ScopedDevice(self.device):
             if self.graph is not None:
                 wp.capture_launch(self.graph)

@@ -3,6 +3,8 @@ import type { LoadedStage } from "../../usd/loadStage";
 import type { EngineLoadResult, PhysicsEngine } from "../engine";
 import {
   axisRotation,
+  driveTargetsAt,
+  hasAnimatedDrives,
   relativePose,
   type BodyInfo,
   type ColliderInfo,
@@ -58,6 +60,65 @@ function shapeSize(c: ColliderInfo): number {
   return 0.1;
 }
 
+interface D6Targets {
+  /** Drive pose of frame1 in frame0, and drive velocities. */
+  position: Vector3;
+  rotation: Quaternion;
+  linear: Vector3;
+  angular: Vector3;
+}
+
+const X_AXIS = new Vector3(1, 0, 0);
+const Y_AXIS = new Vector3(0, 1, 0);
+const Z_AXIS = new Vector3(0, 0, 1);
+
+/** The D6 drive targets of a joint's drives at `time` (s from the start), or null without drives. */
+function d6DriveTargets(j: JointInfo, time: number): D6Targets | null {
+  const targets: D6Targets = { position: new Vector3(), rotation: new Quaternion(), linear: new Vector3(), angular: new Vector3() };
+  switch (j.type) {
+    case "revolute": {
+      if (!j.drives.angular) return null;
+      const { position, velocity } = driveTargetsAt(j.drives.angular, time);
+      targets.rotation.setFromAxisAngle(X_AXIS, position);
+      targets.angular.set(velocity, 0, 0);
+      return targets;
+    }
+    case "prismatic": {
+      if (!j.drives.linear) return null;
+      const { position, velocity } = driveTargetsAt(j.drives.linear, time);
+      targets.position.set(position, 0, 0);
+      targets.linear.set(velocity, 0, 0);
+      return targets;
+    }
+    case "generic": {
+      const euler = new Vector3();
+      let any = false;
+      for (const dof of ["transX", "transY", "transZ", "rotX", "rotY", "rotZ"] as const) {
+        const dr = j.drives[dof];
+        if (!dr) continue;
+        any = true;
+        const { position, velocity } = driveTargetsAt(dr, time);
+        const i = dof.endsWith("X") ? 0 : dof.endsWith("Y") ? 1 : 2;
+        if (dof.startsWith("trans")) {
+          targets.position.setComponent(i, position);
+          targets.linear.setComponent(i, velocity);
+        } else {
+          euler.setComponent(i, position);
+          targets.angular.setComponent(i, velocity);
+        }
+      }
+      if (!any) return null;
+      targets.rotation
+        .setFromAxisAngle(X_AXIS, euler.x)
+        .multiply(new Quaternion().setFromAxisAngle(Y_AXIS, euler.y))
+        .multiply(new Quaternion().setFromAxisAngle(Z_AXIS, euler.z));
+      return targets;
+    }
+    default:
+      return null;
+  }
+}
+
 /** PhysX 5 (WASM) running in the browser, stepped by the viewer. */
 export class PhysXEngine implements PhysicsEngine {
   readonly kind = "physx" as const;
@@ -71,6 +132,8 @@ export class PhysXEngine implements PhysicsEngine {
   private statics: PhysX.PxRigidStatic[] = [];
   private staticByCollider = new Map<ColliderInfo, PhysX.PxRigidStatic>();
   private joints: Releasable[] = [];
+  /** D6 joints whose drive targets are time-sampled; re-targeted before every step. */
+  private animatedDrives: { joint: PhysX.PxD6Joint; info: JointInfo }[] = [];
   private meshes: Releasable[] = [];
   private materials = new Map<string, PhysX.PxMaterial>();
   private poses = new Float32Array(0);
@@ -295,6 +358,9 @@ export class PhysXEngine implements PhysicsEngine {
       // Every other UsdPhysics joint is a D6 joint with the right axes freed.
       const d6 = px.D6JointCreate(rt.physics, actorOrWorld(a0), f0, actorOrWorld(a1), f1);
       this.configureD6(d6, j);
+      const targets = d6DriveTargets(j, 0);
+      if (targets) this.setDriveTargets(d6, targets);
+      if (targets && hasAnimatedDrives(j)) this.animatedDrives.push({ joint: d6, info: j });
       joint = d6;
     }
     px.destroy(f0);
@@ -339,40 +405,21 @@ export class PhysXEngine implements PhysicsEngine {
       d6.setDrive(axis, pd);
       px.destroy(pd);
     };
-    const driveTargets = (position: Vector3, rotation: Quaternion, linear: Vector3, angular: Vector3) => {
-      const t = pxTransform(px, position, rotation);
-      d6.setDrivePosition(t);
-      px.destroy(t);
-      const v = pxVec3(px, linear);
-      const w = pxVec3(px, angular);
-      d6.setDriveVelocity(v, w);
-      px.destroy(v);
-      px.destroy(w);
-    };
-    const xAxis = new Vector3(1, 0, 0);
 
+    // Drive targets are set by the caller (d6DriveTargets), here only the drives.
     switch (j.type) {
       case "revolute": {
         const limited = finite(j.lower) || finite(j.upper);
         d6.setMotion(Axis.eTWIST, limited ? Motion.eLIMITED : Motion.eFREE);
         if (limited) angularPair(j.lower, j.upper);
-        const dr = j.drives.angular;
-        if (dr) {
-          drive(DriveAxis.eTWIST, dr);
-          const target = new Quaternion().setFromAxisAngle(xAxis, dr.targetPosition);
-          driveTargets(new Vector3(), target, new Vector3(), new Vector3(dr.targetVelocity, 0, 0));
-        }
+        if (j.drives.angular) drive(DriveAxis.eTWIST, j.drives.angular);
         break;
       }
       case "prismatic": {
         const limited = finite(j.lower) || finite(j.upper);
         d6.setMotion(Axis.eX, limited ? Motion.eLIMITED : Motion.eFREE);
         if (limited) linearPair(Axis.eX, j.lower, j.upper);
-        const dr = j.drives.linear;
-        if (dr) {
-          drive(DriveAxis.eX, dr);
-          driveTargets(new Vector3(dr.targetPosition, 0, 0), new Quaternion(), new Vector3(dr.targetVelocity, 0, 0), new Vector3());
-        }
+        if (j.drives.linear) drive(DriveAxis.eX, j.drives.linear);
         break;
       }
       case "spherical": {
@@ -420,41 +467,36 @@ export class PhysXEngine implements PhysicsEngine {
           rotY: DriveAxis.eSWING1,
           rotZ: DriveAxis.eSWING2,
         };
-        const pos = new Vector3();
-        const vel = new Vector3();
-        const ang = new Vector3();
-        const euler = new Vector3();
-        let any = false;
         for (const dof of Object.keys(driveAxis) as Dof[]) {
           const dr = j.drives[dof];
-          if (!dr) continue;
-          any = true;
-          drive(driveAxis[dof], dr);
-          const i = dof.endsWith("X") ? 0 : dof.endsWith("Y") ? 1 : 2;
-          if (dof.startsWith("trans")) {
-            pos.setComponent(i, dr.targetPosition);
-            vel.setComponent(i, dr.targetVelocity);
-          } else {
-            euler.setComponent(i, dr.targetPosition);
-            ang.setComponent(i, dr.targetVelocity);
-          }
-        }
-        if (any) {
-          const rot = new Quaternion()
-            .setFromAxisAngle(new Vector3(1, 0, 0), euler.x)
-            .multiply(new Quaternion().setFromAxisAngle(new Vector3(0, 1, 0), euler.y))
-            .multiply(new Quaternion().setFromAxisAngle(new Vector3(0, 0, 1), euler.z));
-          driveTargets(pos, rot, vel, ang);
+          if (dr) drive(driveAxis[dof], dr);
         }
         break;
       }
     }
   }
 
+  private setDriveTargets(d6: PhysX.PxD6Joint, { position, rotation, linear, angular }: D6Targets): void {
+    const { px } = this;
+    const t = pxTransform(px, position, rotation);
+    d6.setDrivePosition(t);
+    px.destroy(t);
+    const v = pxVec3(px, linear);
+    const w = pxVec3(px, angular);
+    d6.setDriveVelocity(v, w);
+    px.destroy(v);
+    px.destroy(w);
+  }
+
   // ---------------------------------------------------------------- stepping
 
   advance(): void {
     if (!this.scene) return;
+    // Time-sampled drive targets for the end of this step, as kinematic targets are.
+    for (const { joint, info } of this.animatedDrives) {
+      const targets = d6DriveTargets(info, this.simTime + this.dt);
+      if (targets) this.setDriveTargets(joint, targets);
+    }
     this.scene.simulate(this.dt);
     this.scene.fetchResults(true);
     this.simTime += this.dt;
@@ -561,6 +603,7 @@ export class PhysXEngine implements PhysicsEngine {
   /** Release in dependency order: joints, actors, scene, then shared meshes and materials. */
   private teardown(): void {
     this.endDrag();
+    this.animatedDrives = [];
     for (const joint of this.joints.splice(0)) joint.release();
     for (const actor of this.actors.splice(0)) actor.release();
     for (const actor of this.statics.splice(0)) actor.release();

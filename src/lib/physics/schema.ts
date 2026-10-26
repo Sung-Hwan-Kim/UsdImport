@@ -68,12 +68,21 @@ export interface BodyInfo {
   colliders: ColliderInfo[];
 }
 
+/** A time-sampled scalar, times in seconds from the stage's start time code. */
+export interface ScalarSamples {
+  times: number[];
+  values: number[];
+}
+
 export interface JointDrive {
   type: "force" | "acceleration";
-  /** rad or m */
+  /** rad or m (at the start, when time-sampled) */
   targetPosition: number;
-  /** rad/s or m/s */
+  /** rad/s or m/s (at the start, when time-sampled) */
   targetVelocity: number;
+  /** Time-sampled targets, in the same units; Isaac Sim moves drives along them while it plays. */
+  targetPositionSamples?: ScalarSamples;
+  targetVelocitySamples?: ScalarSamples;
   stiffness: number;
   damping: number;
   maxForce: number;
@@ -192,6 +201,18 @@ class SpecReader {
     return undefined;
   }
 
+  /** Time samples of the strongest opinion with a value, when it has samples (they win over its default at a time). */
+  samples(obj: Object3D, name: string): { times: number[]; values: unknown[] } | null {
+    for (const t of this.tags(obj)) {
+      const f = this.specs(t)?.[`${t.path}.${name}`]?.fields;
+      if (!f) continue;
+      const samples = f.timeSamples as { times?: number[]; values?: unknown[] } | undefined;
+      if (samples?.times?.length && samples.values?.length) return { times: samples.times, values: samples.values };
+      if (f.default !== undefined) return null;
+    }
+    return null;
+  }
+
   num(obj: Object3D, name: string, fallback: number): number {
     const v = this.attr(obj, name);
     return typeof v === "number" && Number.isFinite(v) ? v : fallback;
@@ -242,6 +263,33 @@ class SpecReader {
 }
 
 // ---------------------------------------------------------------- helpers
+
+/** A sampled value at `time`, interpolated linearly and held past the first and last samples, as USD does. */
+export function sampleScalar({ times, values }: ScalarSamples, time: number): number {
+  let lo = 0;
+  let hi = times.length - 1;
+  if (time <= times[lo]) return values[lo];
+  if (time >= times[hi]) return values[hi];
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (times[mid] <= time) lo = mid;
+    else hi = mid;
+  }
+  return values[lo] + ((values[hi] - values[lo]) * (time - times[lo])) / (times[hi] - times[lo]);
+}
+
+/** A drive's position and velocity targets at `time` (seconds from the stage's start). */
+export function driveTargetsAt(drive: JointDrive, time: number): { position: number; velocity: number } {
+  return {
+    position: drive.targetPositionSamples ? sampleScalar(drive.targetPositionSamples, time) : drive.targetPosition,
+    velocity: drive.targetVelocitySamples ? sampleScalar(drive.targetVelocitySamples, time) : drive.targetVelocity,
+  };
+}
+
+/** Whether any of a joint's drive targets change over time. */
+export function hasAnimatedDrives(joint: JointInfo): boolean {
+  return Object.values(joint.drives).some((d) => d?.targetPositionSamples || d?.targetVelocitySamples);
+}
 
 function worldPose(obj: Object3D): Pose & { scale: Vector3 } {
   const position = new Vector3();
@@ -310,6 +358,21 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
   root.updateWorldMatrix(true, true);
   const unitScale = root.scale.x || 1; // metres per stage unit, as applied by the composer
   const rootRotation = new Quaternion().setFromRotationMatrix(new Matrix4().extractRotation(root.matrixWorld));
+  const { startTimeCode = 0, timeCodesPerSecond } = stage.metadata;
+  /** Time samples of a scalar attribute in simulation time (s from the start) and simulation units. */
+  const scalarSamples = (obj: Object3D, name: string, scale: number): ScalarSamples | undefined => {
+    const samples = reader.samples(obj, name);
+    if (!samples) return undefined;
+    const times: number[] = [];
+    const values: number[] = [];
+    samples.times.forEach((t, i) => {
+      const v = Number(samples.values[i]);
+      if (!Number.isFinite(t) || !Number.isFinite(v)) return;
+      times.push((t - startTimeCode) / timeCodesPerSecond);
+      values.push(v * scale);
+    });
+    return times.length ? { times, values } : undefined;
+  };
 
   // Index objects for relationship targets: per composition instance, and by stage path.
   const byInstance = new Map<string, Object3D>();
@@ -620,14 +683,21 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
       const p = `drive:${name}:physics:`;
       const toRad = angular ? MathUtils.DEG2RAD : unitScale;
       const perRad = angular ? MathUtils.RAD2DEG : 1;
-      joint.drives[name] = {
+      const drive: JointDrive = {
         type: reader.token(obj, `${p}type`) === "acceleration" ? "acceleration" : "force",
         targetPosition: reader.num(obj, `${p}targetPosition`, 0) * toRad,
         targetVelocity: reader.num(obj, `${p}targetVelocity`, 0) * toRad,
+        targetPositionSamples: scalarSamples(obj, `${p}targetPosition`, toRad),
+        targetVelocitySamples: scalarSamples(obj, `${p}targetVelocity`, toRad),
         stiffness: reader.num(obj, `${p}stiffness`, 0) * perRad,
         damping: reader.num(obj, `${p}damping`, 0) * perRad,
         maxForce: reader.num(obj, `${p}maxForce`, Number.POSITIVE_INFINITY) * (angular ? unitScale ** 2 : unitScale),
       };
+      // Simulation starts at the start time code, where the samples (not the default) hold.
+      const start = driveTargetsAt(drive, 0);
+      drive.targetPosition = start.position;
+      drive.targetVelocity = start.velocity;
+      joint.drives[name] = drive;
     }
 
     joints.push(joint);

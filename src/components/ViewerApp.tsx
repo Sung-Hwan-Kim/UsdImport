@@ -121,7 +121,11 @@ function useShortcuts() {
           break;
         }
         case "Space":
-          if (s.animation.duration > 0) {
+          // On a physics stage Space plays the simulation, which drives the timeline (as in Isaac Sim).
+          if (s.stage?.metadata.hasPhysics) {
+            e.preventDefault();
+            s.physicsCommand(s.physics.status === "running" ? "pause" : "play");
+          } else if (s.animation.duration > 0) {
             e.preventDefault();
             const { playing, time, duration } = s.animation;
             s.setAnimation({ playing: !playing, time: !playing && time >= duration ? 0 : time });

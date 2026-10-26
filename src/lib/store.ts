@@ -185,6 +185,9 @@ export const useViewer = create<ViewerState>()(
           }
           const previous = get().stage;
           const duration = stage.animations.reduce((max, clip) => Math.max(max, clip.duration), 0);
+          // Physics stages wait for Play, which runs the simulation with the timeline (as in Isaac Sim);
+          // played alone, their animation would move only the kinematic parts.
+          const autoplay = duration > 0 && !stage.metadata.hasPhysics;
           set((s) => ({
             stage,
             loading: false,
@@ -192,7 +195,7 @@ export const useViewer = create<ViewerState>()(
             selected: null,
             bounds: null,
             session: { source, rootPath, candidates },
-            animation: { ...s.animation, playing: duration > 0, time: 0, duration },
+            animation: { ...s.animation, playing: autoplay, time: 0, duration },
             // The previous stage's runner disposes its engine when it unmounts.
             physics: { ...INITIAL_PHYSICS, speed: s.physics.speed, command: s.physics.command },
             focus: { target: "stage", reset: true, nonce: s.focus.nonce + 1 },
