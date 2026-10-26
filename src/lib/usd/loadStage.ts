@@ -1,6 +1,6 @@
 import type { AnimationClip, Group, Material, Mesh, Object3D, SkinnedMesh, Texture } from "three";
 import { unzipSync } from "three/examples/jsm/libs/fflate.module.js";
-import { ViewerComposer, type ComposeContext, type PrimTag } from "./composer";
+import { transformAnimation, ViewerComposer, type ComposeContext, type PrimTag } from "./composer";
 import {
   SpecType,
   apiSchemasOf,
@@ -227,6 +227,7 @@ export async function loadStage(source: AssetSource, requestedRoot: string, opti
     textureCaches: new Map(),
     texturePromises: [],
     animations: [],
+    animatedXforms: new Map(),
     missing,
     warnings,
     referenceCount: 0,
@@ -236,9 +237,10 @@ export async function loadStage(source: AssetSource, requestedRoot: string, opti
   const composer = new ViewerComposer(ctx, rootPath, [rootPath]);
   const scene = composer.compose(rootData, createAssetMap(assets, index), {}, dirname(rootPath));
   scene.name = name;
-  scene.animations = [...scene.animations, ...ctx.animations];
   scene.userData.usd = { layer: rootPath, path: "/", instance: 0, typeName: "Stage" } satisfies PrimTag;
   applyResetXformStacks(scene);
+  const transforms = transformAnimation(scene, ctx);
+  scene.animations = [...scene.animations, ...ctx.animations, ...(transforms ? [transforms] : [])];
   // Authored visibility, so saving can tell which prims the viewer showed or hid.
   scene.traverse((obj) => (obj.userData.loadedVisible = obj.visible));
   const composeTime = performance.now() - tCompose;

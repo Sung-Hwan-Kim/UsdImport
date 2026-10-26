@@ -89,7 +89,9 @@ npm run build && npm start
 - `active = false`, `visibility = invisible`, `purpose = guide`, 그리고 `over`나 `class`로만 존재하는 프림은 USD와 같이 렌더링에서 제외
 - UsdGeom Mesh / Cube / Sphere / Cylinder / Cone / Capsule, GeomSubset 멀티 머티리얼
 - UsdPreviewSurface / OpenPBR 머티리얼과 텍스처(PNG/JPG/WebP/AVIF), UsdLux 라이트
-- UsdSkel 스키닝, SkelAnimation, 트랜스폼 time sample 애니메이션
+- UsdSkel 스키닝, SkelAnimation, 트랜스폼 time sample 애니메이션 — 모든 프림 타입(Cube·Sphere 등 포함)과 모든 xformOp에서,
+  각 키에서 op 스택 전체를 평가(회전·피벗은 키를 촘촘히), 같은 이름의 프림이나 같은 에셋을 여러 번 참조해도 프림마다 따로 재생,
+  클립 끝을 지나면 마지막 값을 유지
 - 트랜스폼: `xformOpOrder`를 USD 규칙대로 평가 — 접미사 op(`xformOp:scale:pivot` 등), 모든 회전 순서(`rotateZYX` 등), `!invert!`, Maya 피벗, `!resetXformStack!`, half 정밀도 값, 참조 대상과 참조하는 프림의 xform 값 합성
 - `upAxis`(Z-up → Y-up)와 `metersPerUnit` 자동 변환
 - 인스펙터: 트랜스폼, 지오메트리, 머티리얼(텍스처 썸네일 포함), 각 스펙의 USD 원본 프로퍼티
@@ -121,6 +123,8 @@ scripts/generate_samples.py   public/samples 생성 스크립트 (`pip install u
   인라인된 `Vec3d`/`Vec3h` 값, 경로 개수와 인코딩된 경로 개수가 다른 경로 테이블 처리
 - 합성: subLayer 스택, defaultPrim/프림 지정 references, 중첩 참조의 텍스처·애니메이션 전달,
   GeomSubset에 속하지 않은 면, 바인딩되지 않은 메시, UsdLux 라이트의 방향과 exposure
+- 애니메이션: three의 트랜스폼 클립은 일부 op 이름만, Xform/Scope/Mesh 프림만 다루고 트랙을 프림 이름으로 묶어
+  같은 이름의 프림이 모두 첫 번째 프림을 움직였으므로, 스테이지 전체의 트랜스폼 클립을 직접 만들어 오브젝트 uuid로 묶음
 
 이 확장들은 three의 내부(`_`로 시작하는) 메서드를 오버라이드하므로 `three` 버전을 정확히 고정해 두었습니다.
 업그레이드하기 전에 `src/lib/usd/crateParser.ts`와 `composer.ts`를 확인하세요.

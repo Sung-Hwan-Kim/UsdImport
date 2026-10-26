@@ -1,4 +1,19 @@
-import { Euler, Matrix4, Quaternion, type Object3D } from "three";
+import {
+  Euler,
+  Matrix4,
+  Object3D,
+  Quaternion,
+  QuaternionKeyframeTrack,
+  Vector3,
+  VectorKeyframeTrack,
+  type KeyframeTrack,
+} from "three";
+
+/** One attribute's time samples, with times in seconds. */
+export interface XformSamples {
+  times: number[];
+  values: unknown[];
+}
 
 /** A prim's composed xformOp opinions: the op order and the op values. */
 export interface XformOpinions {
@@ -6,6 +21,8 @@ export interface XformOpinions {
   order: string[] | undefined;
   /** `xformOp:*` attribute values by full name (e.g. `xformOp:scale:pivot`). */
   values: Record<string, unknown>;
+  /** Time samples of the `xformOp:*` attributes whose strongest opinion has them. */
+  samples: Record<string, XformSamples>;
 }
 
 export interface EvaluatedXform {
@@ -22,18 +39,27 @@ const RESET_XFORM_STACK = "!resetXformStack!";
 const INVERT = "!invert!";
 const DEG = Math.PI / 180;
 
-export function xformOpinionsOf(data: Record<string, unknown>): XformOpinions {
+export function xformOpinionsOf(data: Record<string, unknown>, samples: Record<string, XformSamples> = {}): XformOpinions {
   const order = data.xformOpOrder;
   const values: Record<string, unknown> = {};
   for (const [name, value] of Object.entries(data)) {
     if (name.startsWith("xformOp:") && value !== undefined && value !== null) values[name] = value;
   }
-  return { order: Array.isArray(order) ? order.map(String) : undefined, values };
+  return { order: Array.isArray(order) ? order.map(String) : undefined, values, samples: { ...samples } };
 }
 
-/** Compose `stronger` over `weaker` per attribute, as USD does across a reference. */
+/**
+ * Compose `stronger` over `weaker` per attribute, as USD does across a
+ * reference: the strongest opinion brings its default and its samples alike.
+ */
 export function mergeXformOpinions(stronger: XformOpinions, weaker: XformOpinions): XformOpinions {
-  return { order: stronger.order ?? weaker.order, values: { ...weaker.values, ...stronger.values } };
+  const samples = { ...weaker.samples };
+  for (const name of Object.keys(stronger.values)) delete samples[name];
+  return {
+    order: stronger.order ?? weaker.order,
+    values: { ...weaker.values, ...stronger.values },
+    samples: { ...samples, ...stronger.samples },
+  };
 }
 
 function numbersOf(value: unknown): number[] | null {
@@ -139,6 +165,155 @@ export function setFromXform(obj: Object3D, { matrix, scale }: EvaluatedXform): 
   if (!orthonormal || rotation.determinant() <= 0) return;
   obj.quaternion.setFromRotationMatrix(rotation);
   obj.scale.set(scale[0], scale[1], scale[2]);
+}
+
+/**
+ * At most this many degrees between keys while a rotate op spins: keys only
+ * hold orientations, and a spin may swing a translation around (pivots).
+ */
+const MAX_ROTATION_STEP = 2;
+/** How often an interval may be halved where interpolating the keys strays from the ops. */
+const MAX_REFINE_DEPTH = 6;
+const POSITION_TOLERANCE = 1e-4;
+/** 1 - |cos(θ/2)| for θ ≈ 0.05°. */
+const ROTATION_TOLERANCE = 1e-7;
+
+interface SampledOp {
+  name: string;
+  type: string;
+  samples: XformSamples;
+}
+
+interface Pose {
+  time: number;
+  position: Vector3;
+  quaternion: Quaternion;
+  scale: Vector3;
+}
+
+/** An op's value at `time`, interpolated as USD does: linearly, quaternions by slerp, held past the ends. */
+function sampleAt(op: SampledOp, time: number): number[] | null {
+  const { times, values } = op.samples;
+  let lo = 0;
+  let hi = times.length - 1;
+  if (time <= times[lo]) return numbersOf(values[lo]);
+  if (time >= times[hi]) return numbersOf(values[hi]);
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (times[mid] <= time) lo = mid;
+    else hi = mid;
+  }
+  const a = numbersOf(values[lo]);
+  const b = numbersOf(values[hi]);
+  if (!a || !b || a.length !== b.length) return a;
+  const f = (time - times[lo]) / (times[hi] - times[lo]);
+  if (op.type === "orient" && a.length >= 4) {
+    const q = new Quaternion(a[0], a[1], a[2], a[3]).slerp(new Quaternion(b[0], b[1], b[2], b[3]), f);
+    return [q.x, q.y, q.z, q.w];
+  }
+  return a.map((v, i) => v + (b[i] - v) * f);
+}
+
+/** Segments an interval needs so no rotate op turns more than MAX_ROTATION_STEP within one. */
+function rotationSteps(ops: SampledOp[], t0: number, t1: number): number {
+  let steps = 1;
+  for (const op of ops) {
+    if (!op.type.startsWith("rotate")) continue;
+    const a = sampleAt(op, t0);
+    const b = sampleAt(op, t1);
+    if (!a || !b) continue;
+    for (let i = 0; i < a.length; i++) {
+      // three's USDA parser pads vectors with NaN.
+      const turn = Math.abs(b[i] - a[i]);
+      if (Number.isFinite(turn)) steps = Math.max(steps, Math.ceil(turn / MAX_ROTATION_STEP));
+    }
+  }
+  return Math.min(steps, 360);
+}
+
+const midPosition = new Vector3();
+const midQuaternion = new Quaternion();
+
+/** Whether interpolating between two keys, as three's tracks do, reproduces `mid`. */
+function interpolates(a: Pose, b: Pose, mid: Pose): boolean {
+  const tolerance = (v: Vector3) => POSITION_TOLERANCE * Math.max(1, v.length());
+  if (midPosition.lerpVectors(a.position, b.position, 0.5).distanceTo(mid.position) > tolerance(mid.position)) return false;
+  if (midPosition.lerpVectors(a.scale, b.scale, 0.5).distanceTo(mid.scale) > tolerance(mid.scale)) return false;
+  return 1 - Math.abs(midQuaternion.slerpQuaternions(a.quaternion, b.quaternion, 0.5).dot(mid.quaternion)) <= ROTATION_TOLERANCE;
+}
+
+/**
+ * Keyframe tracks (position, quaternion, scale) that play a prim's
+ * time-sampled xformOps, or none when no op in its order is time-sampled.
+ * Each key evaluates the whole op stack, so any op type and order animates.
+ * Keys sit at every authored sample time, plus where interpolating the keys
+ * would stray from the ops (spins, pivots, matrix samples), down to one time
+ * code (`frame` seconds) apart. `parentInverse` re-bases each key, as
+ * applyResetXformStacks does for the rest pose.
+ */
+export function xformTracks(node: string, xform: XformOpinions, frame: number, parentInverse?: Matrix4): KeyframeTrack[] {
+  const order = xform.order ?? [];
+  const names = new Set(order.slice(order.lastIndexOf(RESET_XFORM_STACK) + 1).map((e) => (e.startsWith(INVERT) ? e.slice(INVERT.length) : e)));
+  const ops: SampledOp[] = [];
+  for (const name of names) {
+    const samples = xform.samples[name];
+    if (samples?.times.length) ops.push({ name, type: name.split(":")[1] ?? "", samples });
+  }
+  if (!ops.length) return [];
+
+  const target = new Object3D();
+  const poseAt = (time: number): Pose => {
+    const values = { ...xform.values };
+    for (const op of ops) values[op.name] = sampleAt(op, time);
+    const evaluated = evaluateXformOps({ order, values, samples: {} });
+    if (parentInverse) {
+      evaluated.matrix.premultiply(parentInverse);
+      evaluated.scale = null;
+    }
+    setFromXform(target, evaluated);
+    return { time, position: target.position.clone(), quaternion: target.quaternion.clone(), scale: target.scale.clone() };
+  };
+
+  const keys: Pose[] = [];
+  const refine = (a: Pose, b: Pose, depth: number) => {
+    if (depth >= MAX_REFINE_DEPTH || b.time - a.time <= frame * 1.001) return;
+    const mid = poseAt((a.time + b.time) / 2);
+    if (interpolates(a, b, mid)) return;
+    refine(a, mid, depth + 1);
+    keys.push(mid);
+    refine(mid, b, depth + 1);
+  };
+  const times = [...new Set(ops.flatMap((op) => op.samples.times))].sort((a, b) => a - b);
+  let previous = poseAt(times[0]);
+  keys.push(previous);
+  for (let i = 1; i < times.length; i++) {
+    const [t0, t1] = [times[i - 1], times[i]];
+    const steps = rotationSteps(ops, t0, t1);
+    for (let s = 1; s <= steps; s++) {
+      const next = poseAt(t0 + ((t1 - t0) * s) / steps);
+      refine(previous, next, 0);
+      keys.push(next);
+      previous = next;
+    }
+  }
+
+  const keyTimes = new Float32Array(keys.length);
+  const positions = new Float32Array(keys.length * 3);
+  const quaternions = new Float32Array(keys.length * 4);
+  const scales = new Float32Array(keys.length * 3);
+  keys.forEach((key, i) => {
+    // Keep each quaternion in the previous one's hemisphere so keys blend the short way.
+    if (i > 0 && key.quaternion.dot(keys[i - 1].quaternion) < 0) key.quaternion.set(-key.quaternion.x, -key.quaternion.y, -key.quaternion.z, -key.quaternion.w);
+    keyTimes[i] = key.time;
+    key.position.toArray(positions, i * 3);
+    key.quaternion.toArray(quaternions, i * 4);
+    key.scale.toArray(scales, i * 3);
+  });
+  return [
+    new VectorKeyframeTrack(`${node}.position`, keyTimes, positions),
+    new QuaternionKeyframeTrack(`${node}.quaternion`, keyTimes, quaternions),
+    new VectorKeyframeTrack(`${node}.scale`, keyTimes, scales),
+  ];
 }
 
 /**

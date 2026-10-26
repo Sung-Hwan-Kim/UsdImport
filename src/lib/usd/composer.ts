@@ -1,8 +1,9 @@
 import {
+  AnimationClip,
   DoubleSide,
   Group,
+  Matrix4,
   MeshPhysicalMaterial,
-  type AnimationClip,
   type DirectionalLight,
   type Light,
   type LoadingManager,
@@ -15,7 +16,15 @@ import {
 import { USDComposer } from "three/examples/jsm/loaders/usd/USDComposer.js";
 import type { USDLayerData, USDSpec } from "three/examples/jsm/loaders/usd/USDCParser.js";
 import { dirname, normalizePath } from "./paths";
-import { evaluateXformOps, mergeXformOpinions, setFromXform, xformOpinionsOf, type XformOpinions } from "./xformOps";
+import {
+  evaluateXformOps,
+  mergeXformOpinions,
+  setFromXform,
+  xformOpinionsOf,
+  xformTracks,
+  type XformOpinions,
+  type XformSamples,
+} from "./xformOps";
 
 /** Where an Object3D came from, stored on `object.userData.usd`. */
 export interface PrimTag {
@@ -48,6 +57,8 @@ export interface ComposeContext {
   textureCaches: Map<string, Record<string, Texture>>;
   texturePromises: Promise<void>[];
   animations: AnimationClip[];
+  /** Objects whose composed xformOps are time-sampled; the last composition of an object wins. */
+  animatedXforms: Map<Object3D, { xform: XformOpinions; frame: number }>;
   missing: Set<string>;
   warnings: Set<string>;
   referenceCount: number;
@@ -57,6 +68,31 @@ export interface ComposeContext {
 
 /** The xform opinions each object's transform was built from, for prims that reference it. */
 const builtXforms = new WeakMap<Object3D, XformOpinions>();
+
+function isAttached(obj: Object3D, root: Object3D): boolean {
+  for (let cur: Object3D | null = obj; cur; cur = cur.parent) if (cur === root) return true;
+  return false;
+}
+
+/**
+ * One clip playing every time-sampled xform under `root`. three's own clip
+ * only covers a few op names on Xform/Scope/Mesh prims and binds tracks by
+ * prim name, so same-named prims (or several references to one animated
+ * asset) all drove the first match; these tracks bind by object uuid.
+ * Call it after applyResetXformStacks, whose re-basing the tracks repeat.
+ */
+export function transformAnimation(root: Object3D, ctx: ComposeContext): AnimationClip | null {
+  root.updateMatrixWorld(true);
+  const rootInverse = new Matrix4().copy(root.matrixWorld).invert();
+  const tracks = [];
+  for (const [obj, { xform, frame }] of ctx.animatedXforms) {
+    if (!isAttached(obj, root)) continue;
+    const parentInverse =
+      obj.userData.resetXformStack && obj.parent ? new Matrix4().multiplyMatrices(rootInverse, obj.parent.matrixWorld).invert() : undefined;
+    tracks.push(...xformTracks(obj.uuid, xform, frame, parentInverse));
+  }
+  return tracks.length ? new AnimationClip("TransformAnimation", -1, tracks) : null;
+}
 
 function isContainer(obj: Object3D): boolean {
   return obj.type === "Object3D" || obj.type === "Group";
@@ -84,6 +120,8 @@ export class ViewerComposer extends USDComposer {
   private readonly dissolvedTargets = new Map<USDSpec, PrimTag>();
   /** Reference targets' xform opinions, keyed by the referencing prim's fields. */
   private readonly referencedXforms = new Map<Record<string, unknown>, XformOpinions>();
+  /** Time-sampled xformOps of each `_getAttributes` result. */
+  private readonly xformSamples = new WeakMap<Record<string, unknown>, Record<string, XformSamples>>();
   private readonly instance: number;
 
   constructor(
@@ -179,7 +217,7 @@ export class ViewerComposer extends USDComposer {
    * referencing prim's opinions composed over its reference targets'.
    */
   override applyTransform(obj: Object3D, fields: Record<string, unknown>, attrs: Record<string, unknown> = {}): void {
-    const own = xformOpinionsOf({ ...fields, ...attrs });
+    const own = xformOpinionsOf({ ...fields, ...attrs }, this.xformSamples.get(attrs));
     const referenced = this.referencedXforms.get(fields);
     const xform = referenced ? mergeXformOpinions(own, referenced) : own;
     builtXforms.set(obj, xform);
@@ -187,6 +225,37 @@ export class ViewerComposer extends USDComposer {
     for (const op of evaluated.unsupported) this.ctx.warnings.add(`지원하지 않는 xformOp를 건너뛰었습니다: ${op}`);
     setFromXform(obj, evaluated);
     if (evaluated.resetsXformStack) obj.userData.resetXformStack = true;
+    if (Object.keys(xform.samples).length) this.ctx.animatedXforms.set(obj, { xform, frame: 1 / this.fps });
+    else this.ctx.animatedXforms.delete(obj);
+  }
+
+  /** Transform animation is built for the whole stage instead (see transformAnimation). */
+  protected override _buildTransformAnimations(): [] {
+    return [];
+  }
+
+  /**
+   * Remember the time samples of xformOps next to the values three resolves
+   * (default, else the sample at 0 or the first one). A later path overrides
+   * an earlier one per attribute, as three's variant overrides do.
+   */
+  protected override _collectAttributesFromPath(path: string, attrs: Record<string, unknown>): void {
+    super._collectAttributesFromPath(path, attrs);
+    const attributes = this.attributesByPrimPath.get(path);
+    if (!attributes) return;
+    for (const [name, spec] of attributes) {
+      if (!name.startsWith("xformOp:")) continue;
+      const timeSamples = spec.fields.timeSamples as { times?: number[]; values?: unknown[] } | undefined;
+      const sampled = !!timeSamples?.times?.length && !!timeSamples.values;
+      if (!sampled && spec.fields.default === undefined) continue;
+      let samples = this.xformSamples.get(attrs);
+      if (sampled) {
+        if (!samples) this.xformSamples.set(attrs, (samples = {}));
+        samples[name] = { times: timeSamples.times!.map((t) => t / this.fps), values: timeSamples.values! };
+      } else if (samples) {
+        delete samples[name];
+      }
+    }
   }
 
   protected override _getReferences(spec: USDSpec): string[] {

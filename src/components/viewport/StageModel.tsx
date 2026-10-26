@@ -2,10 +2,23 @@
 
 import { useFrame, type ThreeEvent } from "@react-three/fiber";
 import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
-import { AnimationMixer, LoopRepeat, Sphere, Vector3, type DirectionalLight, type Mesh } from "three";
+import { AnimationMixer, Sphere, Vector3, type AnimationClip, type DirectionalLight, type Mesh } from "three";
 import { applyShading, computeBounds, fitDirectionalShadow, isShownInHierarchy } from "@/lib/scene";
 import { useViewer } from "@/lib/store";
 import type { LoadedStage } from "@/lib/usd/loadStage";
+
+/**
+ * Pose every clip at stage time `t`. Past a clip's end it holds its last
+ * pose, as USD holds the last time sample (mixer.setTime would wrap the clip
+ * back to its start).
+ */
+function poseAt(mixer: AnimationMixer, clips: AnimationClip[], t: number): void {
+  for (const clip of clips) {
+    const action = mixer.existingAction(clip);
+    if (action) action.time = Math.min(t, clip.duration);
+  }
+  mixer.update(0);
+}
 
 export default function StageModel({ stage }: { stage: LoadedStage }) {
   const upAxis = useViewer((s) => s.settings.upAxis);
@@ -61,16 +74,17 @@ export default function StageModel({ stage }: { stage: LoadedStage }) {
 
   // All clips share one stage timeline, like USD time codes.
   const mixer = useMemo(() => (stage.animations.length ? new AnimationMixer(stage.scene) : null), [stage]);
+  const lastTime = useRef(-1);
   useEffect(() => {
     if (!mixer) return;
-    for (const clip of stage.animations) mixer.clipAction(clip).setLoop(LoopRepeat, Infinity).play();
+    for (const clip of stage.animations) mixer.clipAction(clip).play();
+    lastTime.current = -1;
     return () => {
       mixer.stopAllAction();
       mixer.uncacheRoot(stage.scene);
     };
   }, [mixer, stage]);
 
-  const lastTime = useRef(-1);
   useFrame((_, delta) => {
     if (!mixer) return;
     const { animation, setAnimation } = useViewer.getState();
@@ -88,7 +102,7 @@ export default function StageModel({ stage }: { stage: LoadedStage }) {
       setAnimation({ time: t });
     }
     if (t !== lastTime.current) {
-      mixer.setTime(t);
+      poseAt(mixer, stage.animations, t);
       lastTime.current = t;
     }
   });

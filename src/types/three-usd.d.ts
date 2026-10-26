@@ -60,6 +60,10 @@ declare module "three/examples/jsm/loaders/usd/USDComposer.js" {
     textureCache: Record<string, Texture>;
     texturePromises: Promise<void>[];
     specsByPath: Record<string, USDSpec>;
+    /** Attribute specs by prim path, then attribute name. */
+    attributesByPrimPath: Map<string, Map<string, USDSpec>>;
+    /** The layer's timeCodesPerSecond (or framesPerSecond, else 24). */
+    fps: number;
     assets: Record<string, unknown>;
     basePath: string;
     externalVariantSelections: Record<string, string>;
@@ -79,6 +83,8 @@ declare module "three/examples/jsm/loaders/usd/USDComposer.js" {
     protected _getReferences(spec: USDSpec): string[];
     protected _getVariantPaths(parentPath: string): string[];
     protected _getAttributes(path: string): Record<string, unknown>;
+    protected _collectAttributesFromPath(path: string, attrs: Record<string, unknown>): void;
+    protected _buildTransformAnimations(): unknown[];
     protected _getGeomSubsets(meshPath: string): { name: string; indices: ArrayLike<number>; materialPath: string | null }[];
     protected _findSingleMesh(group: Object3D): Mesh | null;
     protected _hasNonIdentityTransform(obj: Object3D): boolean;
