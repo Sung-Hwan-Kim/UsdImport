@@ -4,6 +4,7 @@ import {
   Group,
   Matrix4,
   MeshPhysicalMaterial,
+  SRGBColorSpace,
   type DirectionalLight,
   type Light,
   type LoadingManager,
@@ -19,6 +20,7 @@ import { dirname, normalizePath } from "./paths";
 import {
   evaluateXformOps,
   mergeXformOpinions,
+  numbersOf,
   setFromXform,
   xformOpinionsOf,
   xformTracks,
@@ -72,6 +74,29 @@ const builtXforms = new WeakMap<Object3D, XformOpinions>();
 function isAttached(obj: Object3D, root: Object3D): boolean {
   for (let cur: Object3D | null = obj; cur; cur = cur.parent) if (cur === root) return true;
   return false;
+}
+
+/** Brighter than any light authored for Storm-style viewers (UsdLux intensity ~1–10). */
+const RTX_LIGHT_THRESHOLD = 100;
+/** About what RTX's default camera exposure makes of UsdLux intensities. */
+const RTX_EXPOSURE = 1 / 1000;
+
+/**
+ * Omniverse / Isaac Sim author UsdLux intensities for RTX, whose default
+ * camera exposure scales them down about a thousandfold (a DistantLight of
+ * 1000–3000 is ordinary daylight there). three uses intensities as they are,
+ * which washed such stages out to white; scale them as RTX would. Stages lit
+ * like Storm (usdview) stay as authored.
+ */
+export function adaptLightUnits(root: Object3D, warnings: Set<string>): void {
+  const lights: Light[] = [];
+  root.traverse((obj) => {
+    if ((obj as Light).isLight) lights.push(obj as Light);
+  });
+  const brightest = lights.reduce((max, light) => Math.max(max, light.intensity), 0);
+  if (brightest <= RTX_LIGHT_THRESHOLD) return;
+  for (const light of lights) light.intensity *= RTX_EXPOSURE;
+  warnings.add(`라이트 세기(최대 ${+brightest.toPrecision(4)})가 Omniverse(RTX) 기준이라 RTX 기본 노출처럼 1/1000로 줄여 표시합니다.`);
 }
 
 /**
@@ -369,7 +394,26 @@ export class ViewerComposer extends USDComposer {
     for (const path in this.specsByPath) {
       if (path.startsWith(prefix) && path.endsWith(".material:binding")) return super._buildMaterial(meshPath, fields);
     }
-    return new MeshPhysicalMaterial({ roughness: 0.7 });
+    return this.fallbackMaterial(meshPath);
+  }
+
+  /**
+   * The default material takes the prim's displayColor / displayOpacity, as
+   * USD's fallback surface does. three applies them to Mesh prims only (and
+   * only over a white material), so Cube, Sphere, Capsule… stayed white.
+   */
+  private fallbackMaterial(path: string): Material {
+    const material = new MeshPhysicalMaterial({ roughness: 0.7 });
+    const attrs = this._getAttributes(path);
+    // Varying colors are not drawn per vertex; the first one stands for the prim, as in three.
+    const color = numbersOf(attrs["primvars:displayColor"])?.slice(0, 3);
+    if (color?.length === 3 && color.every(Number.isFinite)) material.color.setRGB(color[0], color[1], color[2], SRGBColorSpace);
+    const opacity = numbersOf(attrs["primvars:displayOpacity"])?.[0];
+    if (opacity !== undefined && Number.isFinite(opacity) && opacity < 1) {
+      material.opacity = Math.max(0, opacity);
+      material.transparent = true;
+    }
+    return material;
   }
 
   protected override _applyMaterial(material: Material, materialPath: string): void {

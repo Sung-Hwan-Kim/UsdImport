@@ -62,7 +62,8 @@ export function mergeXformOpinions(stronger: XformOpinions, weaker: XformOpinion
   };
 }
 
-function numbersOf(value: unknown): number[] | null {
+/** A parsed USD value as flat numbers (scalars, tuples, arrays of tuples, typed arrays). */
+export function numbersOf(value: unknown): number[] | null {
   if (typeof value === "number") return [value];
   if (Array.isArray(value)) return value.flat(2).map(Number);
   if (ArrayBuffer.isView(value)) return Array.from(value as unknown as ArrayLike<number>);

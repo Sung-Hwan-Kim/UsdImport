@@ -1,6 +1,6 @@
 import type { AnimationClip, Group, Material, Mesh, Object3D, SkinnedMesh, Texture } from "three";
 import { unzipSync } from "three/examples/jsm/libs/fflate.module.js";
-import { transformAnimation, ViewerComposer, type ComposeContext, type PrimTag } from "./composer";
+import { adaptLightUnits, transformAnimation, ViewerComposer, type ComposeContext, type PrimTag } from "./composer";
 import {
   SpecType,
   apiSchemasOf,
@@ -239,6 +239,7 @@ export async function loadStage(source: AssetSource, requestedRoot: string, opti
   scene.name = name;
   scene.userData.usd = { layer: rootPath, path: "/", instance: 0, typeName: "Stage" } satisfies PrimTag;
   applyResetXformStacks(scene);
+  adaptLightUnits(scene, warnings);
   const transforms = transformAnimation(scene, ctx);
   scene.animations = [...scene.animations, ...ctx.animations, ...(transforms ? [transforms] : [])];
   // Authored visibility, so saving can tell which prims the viewer showed or hid.

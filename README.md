@@ -88,7 +88,8 @@ npm run build && npm start
 - 합성(Composition): `references`(defaultPrim / 프림 지정), `payload`, `subLayers`(스택 병합, `over` 오버라이드), USDC `variantSets`
 - `active = false`, `visibility = invisible`, `purpose = guide`, 그리고 `over`나 `class`로만 존재하는 프림은 USD와 같이 렌더링에서 제외
 - UsdGeom Mesh / Cube / Sphere / Cylinder / Cone / Capsule, GeomSubset 멀티 머티리얼
-- UsdPreviewSurface / OpenPBR 머티리얼과 텍스처(PNG/JPG/WebP/AVIF), UsdLux 라이트
+- UsdPreviewSurface / OpenPBR 머티리얼과 텍스처(PNG/JPG/WebP/AVIF), 머티리얼이 없는 프림의 `displayColor`·`displayOpacity`(Cube·Sphere 등 포함)
+- UsdLux 라이트 — Omniverse/Isaac Sim처럼 세기가 RTX 기준(가장 밝은 라이트가 100 초과)이면 RTX 기본 노출처럼 1/1000로 줄여 표시
 - UsdSkel 스키닝, SkelAnimation, 트랜스폼 time sample 애니메이션 — 모든 프림 타입(Cube·Sphere 등 포함)과 모든 xformOp에서,
   각 키에서 op 스택 전체를 평가(회전·피벗은 키를 촘촘히), 같은 이름의 프림이나 같은 에셋을 여러 번 참조해도 프림마다 따로 재생,
   클립 끝을 지나면 마지막 값을 유지
@@ -123,6 +124,7 @@ scripts/generate_samples.py   public/samples 생성 스크립트 (`pip install u
   인라인된 `Vec3d`/`Vec3h` 값, 경로 개수와 인코딩된 경로 개수가 다른 경로 테이블 처리
 - 합성: subLayer 스택, defaultPrim/프림 지정 references, 중첩 참조의 텍스처·애니메이션 전달,
   GeomSubset에 속하지 않은 면, 바인딩되지 않은 메시, UsdLux 라이트의 방향과 exposure
+- 머티리얼: three는 `displayColor`를 Mesh 프림에만 적용하므로, 바인딩되지 않은 모든 지오메트리의 기본 머티리얼에 직접 반영
 - 애니메이션: three의 트랜스폼 클립은 일부 op 이름만, Xform/Scope/Mesh 프림만 다루고 트랙을 프림 이름으로 묶어
   같은 이름의 프림이 모두 첫 번째 프림을 움직였으므로, 스테이지 전체의 트랜스폼 클립을 직접 만들어 오브젝트 uuid로 묶음
 
