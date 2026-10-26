@@ -9,6 +9,28 @@ export interface ScriptDoc {
   saved: string;
 }
 
+/** Where a script runs: OpenUSD alone on the local server, or Isaac Sim. */
+export type RunMode = "pxr" | "isaac";
+export type RunChoice = "auto" | RunMode;
+export type OutputStream = "stdout" | "stderr" | "info";
+
+export interface OutputChunk {
+  stream: OutputStream;
+  text: string;
+}
+
+export interface ScriptRun {
+  docId: string;
+  name: string;
+  mode: RunMode;
+  /** How the server runs it: "pxr", "isaac-snippet" or "isaac-standalone". */
+  runner?: string;
+  startedAt: number;
+}
+
+/** Output kept for the panel; older text is dropped past this many characters. */
+const MAX_OUTPUT = 200_000;
+
 interface ScriptState {
   docs: ScriptDoc[];
   activeId: string | null;
@@ -16,6 +38,10 @@ interface ScriptState {
   maximized: boolean;
   /** Editor dock height in px. */
   height: number;
+  runChoice: RunChoice;
+  run: ScriptRun | null;
+  output: OutputChunk[];
+  outputOpen: boolean;
 
   addDoc(name: string, content: string, saved?: string): string;
   closeDoc(id: string): void;
@@ -25,6 +51,14 @@ interface ScriptState {
   setOpen(open: boolean): void;
   setMaximized(maximized: boolean): void;
   setHeight(height: number): void;
+  setRunChoice(choice: RunChoice): void;
+  /** A new run starts with an empty output panel. */
+  startRun(run: Omit<ScriptRun, "startedAt">): void;
+  updateRun(patch: Partial<ScriptRun>): void;
+  endRun(): void;
+  appendOutput(stream: OutputStream, text: string): void;
+  clearOutput(): void;
+  setOutputOpen(open: boolean): void;
 }
 
 let nextId = Date.now();
@@ -38,6 +72,10 @@ export const useScripts = create<ScriptState>()(
       open: false,
       maximized: false,
       height: 320,
+      runChoice: "auto",
+      run: null,
+      output: [],
+      outputOpen: false,
 
       addDoc(name, content, saved = content) {
         const id = `script-${nextId++}`;
@@ -70,12 +108,42 @@ export const useScripts = create<ScriptState>()(
       setHeight(height) {
         set({ height });
       },
+      setRunChoice(runChoice) {
+        set({ runChoice });
+      },
+      startRun(run) {
+        set({ run: { ...run, startedAt: Date.now() }, output: [], outputOpen: true });
+      },
+      updateRun(patch) {
+        set((s) => (s.run ? { run: { ...s.run, ...patch } } : {}));
+      },
+      endRun() {
+        set({ run: null });
+      },
+      appendOutput(stream, text) {
+        set((s) => {
+          const output = s.output.slice();
+          const last = output[output.length - 1];
+          if (last?.stream === stream) output[output.length - 1] = { stream, text: last.text + text };
+          else output.push({ stream, text });
+          let size = output.reduce((n, c) => n + c.text.length, 0);
+          while (size > MAX_OUTPUT && output.length > 1) size -= output.shift()!.text.length;
+          if (size > MAX_OUTPUT) output[0] = { ...output[0], text: output[0].text.slice(size - MAX_OUTPUT) };
+          return { output };
+        });
+      },
+      clearOutput() {
+        set({ output: [] });
+      },
+      setOutputOpen(outputOpen) {
+        set({ outputOpen });
+      },
     }),
     {
       name: "usd-viewer-scripts",
       storage: createJSONStorage(() => localStorage),
       version: 1,
-      partialize: (s) => ({ docs: s.docs, activeId: s.activeId, open: s.open, height: s.height }),
+      partialize: (s) => ({ docs: s.docs, activeId: s.activeId, open: s.open, height: s.height, runChoice: s.runChoice }),
     },
   ),
 );

@@ -3,12 +3,13 @@
 import { diagnosticCount } from "@codemirror/lint";
 import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
-import { Crosshair, FilePlus, FolderOpen, Maximize2, Minimize2, Save, SaveAll, X } from "lucide-react";
+import { ChevronDown, Crosshair, Eraser, FilePlus, FolderOpen, Maximize2, Minimize2, Play, Save, SaveAll, Square, Terminal, X } from "lucide-react";
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { stagePathOf } from "@/lib/scene";
 import { scriptExtensions } from "@/lib/scripts/editor";
 import { forgetHandle, pickScripts, saveScript } from "@/lib/scripts/files";
-import { isDirty, useScripts, type ScriptDoc } from "@/lib/scripts/store";
+import { detectRunMode, RUN_MODE_LABEL, runScript, stopScript } from "@/lib/scripts/run";
+import { isDirty, useScripts, type RunChoice, type ScriptDoc, type ScriptRun } from "@/lib/scripts/store";
 import { SCRIPT_TEMPLATES, type ScriptTemplate } from "@/lib/scripts/templates";
 import { useViewer } from "@/lib/store";
 import { cn, IconButton, MenuItem, Popover } from "./ui";
@@ -62,13 +63,156 @@ function TemplateMenu({ side = "bottom" }: { side?: "top" | "bottom" }) {
   );
 }
 
+const RUN_CHOICES: { choice: RunChoice; title: string; hint: string }[] = [
+  { choice: "auto", title: "자동", hint: "Isaac Sim 모듈을 쓰면 Isaac Sim, 아니면 pxr" },
+  { choice: "pxr", title: "pxr (빠른 실행)", hint: "OpenUSD만 · 1초 안팎" },
+  { choice: "isaac", title: "Isaac Sim", hint: "실제 Isaac Sim · 기동 10–40초" },
+];
+
+const RUNNER_LABEL: Record<string, string> = {
+  pxr: "pxr",
+  "isaac-snippet": "Isaac Sim 헤드리스",
+  "isaac-standalone": "Isaac Sim 앱",
+};
+
+function RunControls({ active }: { active: ScriptDoc | null }) {
+  const run = useScripts((s) => s.run);
+  const runChoice = useScripts((s) => s.runChoice);
+  if (run) {
+    return (
+      <button
+        type="button"
+        onClick={stopScript}
+        title="실행 중지 (Isaac Sim도 함께 종료)"
+        className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md bg-danger/15 px-2.5 text-[12.5px] font-medium text-danger hover:bg-danger/25"
+      >
+        <Square className="size-3 fill-current" strokeWidth={2} />
+        중지
+      </button>
+    );
+  }
+  const mode = runChoice === "auto" ? detectRunMode(active?.content ?? "") : runChoice;
+  return (
+    <div className="flex shrink-0 items-center">
+      <button
+        type="button"
+        disabled={!active}
+        onClick={() => active && void runScript(active.id)}
+        title="실행 (Ctrl+Enter)"
+        className="inline-flex h-7 items-center gap-1.5 rounded-l-md bg-accent-strong pr-2 pl-2.5 text-[12.5px] font-medium text-white hover:bg-accent disabled:pointer-events-none disabled:opacity-35"
+      >
+        <Play className="size-3 fill-current" strokeWidth={2} />
+        실행
+        <span className="text-[11px] font-normal opacity-80">{runChoice === "auto" ? `자동 · ${RUN_MODE_LABEL[mode]}` : RUN_MODE_LABEL[mode]}</span>
+      </button>
+      <Popover
+        align="right"
+        trigger={({ toggle, open }) => (
+          <button
+            type="button"
+            onClick={toggle}
+            aria-label="실행 방식"
+            title="실행 방식"
+            className={cn("inline-flex h-7 items-center rounded-r-md border-l border-white/20 bg-accent-strong px-1 text-white hover:bg-accent", open && "bg-accent")}
+          >
+            <ChevronDown className="size-3.5" />
+          </button>
+        )}
+      >
+        {(close) => (
+          <div className="w-80">
+            <div className="px-2.5 pt-1.5 pb-1 text-[11px] font-semibold tracking-wide text-muted uppercase">실행 방식</div>
+            {RUN_CHOICES.map((c) => (
+              <MenuItem
+                key={c.choice}
+                active={c.choice === runChoice}
+                hint={c.hint}
+                onClick={() => {
+                  close();
+                  useScripts.getState().setRunChoice(c.choice);
+                }}
+              >
+                {c.title}
+              </MenuItem>
+            ))}
+            <p className="border-t border-line px-2.5 pt-2 pb-1.5 text-[11.5px] leading-relaxed text-faint">
+              로컬 서버(<code className="font-mono">npm run newton</code>)에서 열린 스테이지에 실행하고, 스크립트가 바꾼 스테이지를 다시
+              불러옵니다. 스니펫의 <code className="font-mono">omni.usd.get_context().get_stage()</code>가 그 스테이지입니다.
+            </p>
+          </div>
+        )}
+      </Popover>
+    </div>
+  );
+}
+
+function RunStatus({ run }: { run: ScriptRun }) {
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    const timer = window.setInterval(() => setElapsed(Math.floor((Date.now() - run.startedAt) / 1000)), 1000);
+    return () => window.clearInterval(timer);
+  }, [run.startedAt]);
+  return (
+    <span className="flex min-w-0 items-center gap-1.5 text-muted">
+      <span className="inline-block size-3 shrink-0 animate-spin-slow rounded-full border-2 border-line-strong border-t-accent" />
+      <span className="truncate">
+        {run.name} 실행 중 · {RUNNER_LABEL[run.runner ?? ""] ?? RUN_MODE_LABEL[run.mode]} · {elapsed}초
+      </span>
+    </span>
+  );
+}
+
+/** Script output: stdout, stderr in red, the viewer's own notes dimmed. Follows the end unless scrolled up. */
+function OutputPanel() {
+  const output = useScripts((s) => s.output);
+  const run = useScripts((s) => s.run);
+  const body = useRef<HTMLPreElement>(null);
+  const stick = useRef(true);
+  const { clearOutput, setOutputOpen } = useScripts.getState();
+
+  useEffect(() => {
+    const el = body.current;
+    if (el && stick.current) el.scrollTop = el.scrollHeight;
+  }, [output]);
+
+  return (
+    <div className="flex h-[40%] min-h-24 shrink-0 flex-col border-t border-line bg-bg">
+      <div className="flex h-7 shrink-0 items-center gap-2 border-b border-line pr-1 pl-3 text-[12px]">
+        <Terminal className="size-3.5 shrink-0 text-muted" strokeWidth={1.75} />
+        <span className="font-medium text-fg">출력</span>
+        {run && <RunStatus run={run} />}
+        <div className="ml-auto flex items-center">
+          <IconButton icon={Eraser} label="출력 지우기" onClick={clearOutput} className="size-6" />
+          <IconButton icon={X} label="출력 닫기" onClick={() => setOutputOpen(false)} className="size-6" />
+        </div>
+      </div>
+      <pre
+        ref={body}
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          stick.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+        }}
+        className="scroll-thin min-h-0 flex-1 overflow-auto px-3 py-2 font-mono text-[12px] leading-relaxed break-words whitespace-pre-wrap"
+      >
+        {output.map((chunk, i) => (
+          <span key={i} className={chunk.stream === "stderr" ? "text-danger" : chunk.stream === "info" ? "text-muted" : "text-fg"}>
+            {chunk.text}
+          </span>
+        ))}
+        {!output.length && <span className="font-sans text-faint">실행(Ctrl+Enter)하면 스크립트의 출력이 여기에 나옵니다.</span>}
+      </pre>
+    </div>
+  );
+}
+
 function EmptyEditor() {
   return (
     <div className="absolute inset-0 flex items-center justify-center overflow-y-auto bg-bg p-6">
       <div className="w-full max-w-md text-center">
         <div className="text-[14px] font-medium text-fg">Isaac Sim Python 스크립트</div>
         <p className="mt-1.5 text-[12.5px] leading-relaxed text-muted">
-          .py 파일을 열거나 화면에 끌어다 놓으세요. 템플릿으로 새로 시작할 수도 있습니다.
+          .py 파일을 열거나 화면에 끌어다 놓으세요. 템플릿으로 새로 시작할 수도 있습니다. 실행(Ctrl+Enter)은 로컬 서버에서
+          pxr 또는 Isaac Sim으로 합니다.
         </p>
         <button
           type="button"
@@ -107,6 +251,8 @@ export default function ScriptEditor() {
   const activeId = useScripts((s) => s.activeId);
   const height = useScripts((s) => s.height);
   const maximized = useScripts((s) => s.maximized);
+  const outputOpen = useScripts((s) => s.outputOpen);
+  const running = useScripts((s) => s.run !== null);
   const selected = useViewer((s) => s.selected);
   const host = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
@@ -138,6 +284,7 @@ export default function ScriptEditor() {
       doc: content,
       extensions: scriptExtensions({
         onSave: () => void save(id),
+        onRun: () => void runScript(id),
         onChange: (state, docChanged) => {
           if (docChanged) useScripts.getState().setContent(id, state.doc.toString());
           const head = state.selection.main.head;
@@ -206,7 +353,7 @@ export default function ScriptEditor() {
   };
 
   const active = docs.find((d) => d.id === activeId) ?? null;
-  const { setActive, setOpen, setMaximized } = useScripts.getState();
+  const { setActive, setOpen, setMaximized, setOutputOpen } = useScripts.getState();
 
   return (
     <section
@@ -247,6 +394,8 @@ export default function ScriptEditor() {
             </div>
           ))}
         </div>
+        <RunControls active={active} />
+        <div className="mx-0.5 h-5 w-px bg-line" />
         <TemplateMenu />
         <IconButton icon={FolderOpen} label="스크립트 열기 (.py)" onClick={() => void pickScripts()} />
         <IconButton icon={Save} label="저장" shortcut="Ctrl+S" disabled={!active} onClick={() => active && void save(active.id)} />
@@ -265,6 +414,7 @@ export default function ScriptEditor() {
         <div ref={host} className="absolute inset-0" />
         {!active && <EmptyEditor />}
       </div>
+      {outputOpen && <OutputPanel />}
       <footer className="flex h-6 shrink-0 items-center gap-3 border-t border-line px-3 font-mono text-[11px] text-faint">
         {active && (
           <>
@@ -275,7 +425,17 @@ export default function ScriptEditor() {
           </>
         )}
         {notice && <span className="truncate font-sans text-ok">{notice}</span>}
-        <span className="ml-auto whitespace-nowrap">Python · Isaac Sim 6.x</span>
+        {!outputOpen && (
+          <button
+            type="button"
+            onClick={() => setOutputOpen(true)}
+            className={cn("ml-auto inline-flex items-center gap-1 font-sans hover:text-fg", running && "text-accent")}
+          >
+            <Terminal className="size-3" strokeWidth={1.75} />
+            {running ? "실행 중 · 출력 보기" : "출력"}
+          </button>
+        )}
+        <span className={cn("whitespace-nowrap", outputOpen && "ml-auto")}>Python · Isaac Sim 6.x</span>
       </footer>
     </section>
   );

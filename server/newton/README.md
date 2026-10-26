@@ -3,6 +3,7 @@
 웹 뷰어의 **Newton** 엔진 백엔드입니다. 브라우저가 스테이지의 USD 파일을 WebSocket으로 보내면, 이 서버가
 OpenUSD로 합성하고 [NVIDIA Newton](https://github.com/newton-physics/newton)(Warp 기반)으로 시뮬레이션한 뒤
 리지드 바디 포즈와 천 파티클 위치를 실시간으로 돌려보냅니다. `127.0.0.1`에만 바인딩되며, 업로드된 파일은 세션별 임시 폴더에 저장되었다가 연결이 끊기면 삭제됩니다.
+OpenUSD로 스테이지를 저장하고, 스크립트 에디터의 스크립트를 pxr 또는 Isaac Sim으로 실행하는 일도 이 서버가 맡습니다.
 
 ## 요구 사항
 
@@ -17,6 +18,7 @@ OpenUSD로 합성하고 [NVIDIA Newton](https://github.com/newton-physics/newton
 npm run newton:setup   # .venv-newton 생성 + newton[importers]==1.7.0, websockets 설치
 npm run newton         # ws://127.0.0.1:8765 에서 대기 (기본: CUDA가 있으면 cuda:0)
 npm run newton -- --device cpu --port 8800
+npm run newton -- --isaac-sim "C:\isaacsim"   # 스크립트 실행에 쓸 Isaac Sim 폴더 (기본: 자동으로 찾음)
 ```
 
 직접 실행할 수도 있습니다: `.venv-newton/Scripts/python server/newton/server.py --device cuda:0` (Linux/macOS는 `.venv-newton/bin/python`).
@@ -71,6 +73,26 @@ npm run newton -- --device cpu --port 8800
 변경 사항(`edits`: 프림 경로별 `matrix`(행 우선 4×4) · `resetXformStack` · `visibility` · `points`)을 기록하고, 원본 옆에
 `Export`해 결과 파일을 돌려줍니다. 브라우저 구현(`src/lib/usd/sdf/edits.ts`)과 같은 방식으로 기록합니다.
 
+## 스크립트 실행
+
+뷰어 스크립트 에디터의 **실행**(`Ctrl+Enter`)은 이 서버로 스크립트와 열린 스테이지의 레이어 파일을 보냅니다. 서버는 스크립트를
+자식 프로세스로 실행해 출력을 실시간으로 돌려보내고, 스크립트가 루트 레이어를 바꾸면 그 파일을 돌려보내 뷰어가 다시 불러오게 합니다
+(스테이지가 없으면 스크립트가 만든 새 스테이지). 구현: `scripts.py`, `runners/`.
+
+| 방식 | 실행 환경 | 동작 |
+|---|---|---|
+| **pxr** | 이 서버의 Python(`usd-core`) | `runners/pxr_runner.py`가 스테이지를 `Usd.Stage.Open`으로 열고, `omni.usd.get_context().get_stage()`가 그 스테이지를 돌려주게 한 뒤 실행합니다. 1초 안팎이며, 그 밖의 Isaac Sim · Kit 모듈(`isaacsim`, `omni.*`, `carb`)은 쓸 수 없다고 안내합니다 |
+| **Isaac Sim** (스니펫) | Isaac Sim의 `python.bat` / `python.sh` | `runners/isaac_snippet.py`가 헤드리스 `SimulationApp(open_usd=스테이지)`을 띄우고 Script Editor처럼 실행합니다. Kit의 기동 로그는 감추고(실패하면 보여 줌), Kit이 스테이지를 열 때 루트 레이어에 써 넣는 뷰포트 렌더 설정(`/Render/OmniverseKit…`, `OmniverseKit_*` 카메라 오버)은 빼고 저장합니다. 기동에 10–40초 걸립니다 |
+| **Isaac Sim** (Standalone) | 〃 | 스크립트에 `SimulationApp(`이 있으면 그대로 실행합니다(`headless: False`면 Isaac Sim 창이 뜸). 뷰어 스테이지의 복사본 경로는 환경 변수 `USD_VIEWER_STAGE`에 있고, 그 파일을 저장하면 뷰어에 반영됩니다 |
+
+- Isaac Sim 폴더는 `--isaac-sim`, `ISAAC_SIM_PATH`(또는 `ISAACSIM_PATH`) 환경 변수 순으로 쓰고, 없으면 홈 폴더 · 드라이브 루트 두 단계 아래에서
+  `isaac-sim*` / `isaacsim*` 폴더를 찾습니다(서버 시작 로그에 찾은 경로가 나옴).
+- 오류가 나도 그 전에 바꾼 내용은 Isaac Sim의 Script Editor처럼 남깁니다. 트레이스백은 스크립트 자신의 프레임부터 보여 줍니다.
+- **보안**: 스크립트 실행은 이 PC에서 연 뷰어 페이지(Origin이 `localhost` · `127.0.0.1` · `[::1]`)만 허용합니다. 브라우저는 어느 웹 페이지든
+  localhost WebSocket에 접속할 수 있으므로, 다른 사이트가 코드를 실행하지 못하게 막는 장치입니다. 다른 주소로 띄운 뷰어에서 쓰려면
+  `npm run newton -- --allow-origin https://viewer.example.com`처럼 허용할 Origin을 지정하세요.
+- 중지하면 자식 프로세스 트리(Isaac Sim 포함)를 강제로 끝냅니다. 연결이 끊겨도 마찬가지입니다.
+
 ## 프로토콜
 
 WebSocket, JSON 텍스트 메시지 + 바이너리 프레임.
@@ -81,9 +103,11 @@ WebSocket, JSON 텍스트 메시지 + 바이너리 프레임.
 | | `{"type":"save","root","files":[…],"format":"usda"\|"usdc"\|"usd","edits":[…]}` 다음에 파일 바이너리 — 뷰어의 변경 사항을 루트 레이어에 기록해 OpenUSD로 내보낸 파일을 바이너리 메시지 하나로 돌려줌 |
 | | `{"type":"play"}`, `{"type":"pause"}`, `{"type":"step"}`, `{"type":"reset"}`, `{"type":"speed","value":1}` |
 | | `{"type":"drag","body":<index>,"local":[x,y,z],"target":[x,y,z]}` (local은 바디 좌표계, target은 스테이지 좌표계), `{"type":"drag_particle","particle":<index>,"target":[x,y,z]}`, `{"type":"drag_end"}` |
+| | `{"type":"run","mode":"pxr"\|"isaac","name","script","root"\|null,"files":[…]}` 다음에 파일 바이너리(스테이지가 없으면 `files: []`), `{"type":"stop"}` |
 | 서버 → 클라이언트 | `{"type":"ready","bodies":[프림 경로…],"cloths":[{"path","start","count"}…],"particles","device","solver","dt","substeps","upAxis","metersPerUnit","joints","shapes","warnings"}` |
 | | 프레임(바이너리, little-endian float32): `[simTime, bodyCount, particleCount, bodyCount × (px, py, pz, qx, qy, qz, qw), particleCount × (x, y, z)]` — 재생 중 프레임마다, 그리고 load / step / reset 직후 |
 | | `{"type":"status","state":"playing"|"paused"}`, `{"type":"error","message"}` |
+| | 스크립트: `{"type":"run_started","runner":"pxr"\|"isaac-snippet"\|"isaac-standalone"}`, `{"type":"output","stream":"stdout"\|"stderr","text"}`, 바뀐 스테이지가 있으면 `{"type":"stage","name","new"}` 다음에 그 파일 바이너리, 마지막에 `{"type":"run_done","code","stopped","seconds"}` |
 
 ## 제한 사항
 

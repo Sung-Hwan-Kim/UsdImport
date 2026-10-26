@@ -31,6 +31,8 @@ from websockets.exceptions import ConnectionClosed
 
 import newton
 
+from scripts import ScriptRun, find_isaac_sim, origin_allowed
+
 MAX_UPLOAD_BYTES = 1 << 30
 # Mouse spring as accelerations (1/s^2, 1/s), independent of body mass and stage units.
 DRAG_STIFFNESS = 400.0
@@ -1071,11 +1073,14 @@ def safe_relative_path(raw: str) -> PurePosixPath:
 
 
 class Connection:
-    """One browser client: receives the stage, then plays it back on request."""
+    """One browser client: receives the stage, then plays it back, saves it, or runs a script on it."""
 
-    def __init__(self, ws: ServerConnection, device: str, executor: ThreadPoolExecutor):
+    def __init__(self, ws: ServerConnection, device: str, executor: ThreadPoolExecutor, isaac_sim: Path | None, origins: list[str]):
         self.ws = ws
         self.device = device
+        self.isaac_sim = isaac_sim
+        self.may_run_scripts = origin_allowed(ws.request.headers.get("Origin") if ws.request else None, origins)
+        self.script: ScriptRun | None = None
         # Warp work stays on one thread so CUDA graphs and streams are not shared across threads.
         self.executor = executor
         self.loop = asyncio.get_running_loop()
@@ -1090,6 +1095,9 @@ class Connection:
 
     async def send_json(self, message: dict) -> None:
         await self.ws.send(json.dumps(message, ensure_ascii=False))
+
+    async def send_bytes(self, data: bytes) -> None:
+        await self.ws.send(data)
 
     async def send_frame(self) -> None:
         if self.sim is not None:
@@ -1113,6 +1121,8 @@ class Connection:
             pass
         finally:
             ticker.cancel()
+            if self.script is not None:
+                self.script.stop()
             shutil.rmtree(self.workdir, ignore_errors=True)
 
     async def handle(self, message: str | bytes) -> None:
@@ -1121,8 +1131,10 @@ class Connection:
             return
         msg = json.loads(message)
         kind = msg.get("type")
-        if kind in ("load", "save"):
+        if kind in ("load", "save", "run"):
             await self.begin_upload(msg)
+        elif kind == "stop" and self.script is not None:
+            self.script.stop()
         elif kind == "play":
             await self.set_playing(self.sim is not None)
         elif kind == "pause":
@@ -1145,17 +1157,26 @@ class Connection:
             await self.run_sim(self.sim.clear_drag)
 
     async def begin_upload(self, msg: dict) -> None:
+        run = msg.get("type") == "run"
+        if run and not self.may_run_scripts:
+            raise ValueError(
+                "이 페이지에서는 스크립트를 실행할 수 없습니다. 이 PC에서 연 뷰어만 허용하며, "
+                "다른 주소라면 서버를 --allow-origin <주소>로 실행하세요."
+            )
+        if self.script is not None:
+            raise ValueError("이미 스크립트가 실행 중입니다.")
         self.playing = False
         self.sim = None
         shutil.rmtree(self.workdir, ignore_errors=True)
         self.workdir.mkdir(parents=True)
         files = [(safe_relative_path(f["path"]), int(f["size"])) for f in msg.get("files", [])]
-        if not files:
+        # A script may run without a stage.
+        if not files and not run:
             raise ValueError("업로드할 파일이 없습니다.")
         if sum(size for _, size in files) > MAX_UPLOAD_BYTES:
             raise ValueError("업로드 크기 제한(1GB)을 넘었습니다.")
         self.upload = {
-            "root": safe_relative_path(msg["root"]),
+            "root": safe_relative_path(msg["root"]) if files else None,
             "files": files,
             "received": 0,
             "solver": msg.get("solver", "xpbd"),
@@ -1163,7 +1184,10 @@ class Connection:
             "fps": float(msg.get("fps", 60)),
             # "save": author edits into the root layer and send it back instead of simulating.
             "save": {"edits": msg.get("edits", []), "format": msg.get("format", "usda")} if msg.get("type") == "save" else None,
+            "run": msg if run else None,
         }
+        if not files:
+            await self.finish_upload()
 
     async def receive_file(self, data: bytes) -> None:
         upload = self.upload
@@ -1178,8 +1202,27 @@ class Connection:
         upload["received"] += 1
         if upload["received"] < len(upload["files"]):
             return
+        await self.finish_upload()
+
+    async def finish_upload(self) -> None:
+        upload = self.upload
         self.upload = None
-        root = self.workdir / Path(*upload["root"].parts)
+        root = self.workdir / Path(*upload["root"].parts) if upload["root"] else None
+        run = upload["run"]
+        if run is not None:
+            self.script = ScriptRun(
+                script=str(run.get("script", "")),
+                name=str(run.get("name", "script.py")),
+                mode=str(run.get("mode", "pxr")),
+                stage=root,
+                workdir=self.workdir,
+                isaac_sim=self.isaac_sim,
+                send_json=self.send_json,
+                send_bytes=self.send_bytes,
+            )
+            print(f"[newton] running {self.script.script_path.name} ({self.script.kind}) on {upload['root'] or 'a new stage'}")
+            asyncio.create_task(self.run_script(self.script))
+            return
         save = upload["save"]
         if save is not None:
             if save["format"] not in ("usda", "usdc", "usd"):
@@ -1195,6 +1238,22 @@ class Connection:
         )
         await self.send_json(self.sim.ready_message())
         await self.send_frame()
+
+    async def run_script(self, script: ScriptRun) -> None:
+        """Runs beside the message loop, so a stop request gets through while the script runs."""
+        try:
+            await script.run()
+        except ConnectionClosed:
+            script.stop()
+        except Exception as e:
+            traceback.print_exc()
+            script.stop()
+            try:
+                await self.send_json({"type": "error", "message": str(e) or e.__class__.__name__})
+            except ConnectionClosed:
+                pass
+        finally:
+            self.script = None
 
     async def tick(self) -> None:
         """Advance in real time x speed while playing, sending one frame per simulated frame."""
@@ -1219,7 +1278,16 @@ async def main() -> None:
     parser.add_argument("--host", default="127.0.0.1", help="bind address (default: localhost only)")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--device", default=None, help="Warp device, e.g. cuda:0 or cpu (default: CUDA if available)")
+    parser.add_argument("--isaac-sim", default=None, help="Isaac Sim folder for running editor scripts (default: ISAAC_SIM_PATH or a search)")
+    parser.add_argument(
+        "--allow-origin", action="append", default=[], help="extra page origin allowed to run scripts, e.g. https://viewer.example.com"
+    )
     args = parser.parse_args()
+    isaac_sim = find_isaac_sim(args.isaac_sim)
+    if isaac_sim:
+        print(f"[newton] Isaac Sim for scripts: {isaac_sim}")
+    else:
+        print("[newton] Isaac Sim not found: scripts run with pxr only (--isaac-sim <folder> to set it)")
 
     wp.init()
     device = args.device or ("cuda:0" if wp.is_cuda_available() else "cpu")
@@ -1227,7 +1295,7 @@ async def main() -> None:
 
     async def handler(ws: ServerConnection) -> None:
         print(f"[newton] client connected from {ws.remote_address}")
-        await Connection(ws, device, executor).serve()
+        await Connection(ws, device, executor, isaac_sim, args.allow_origin).serve()
         print("[newton] client disconnected")
 
     async with serve(handler, args.host, args.port, max_size=MAX_UPLOAD_BYTES) as server:

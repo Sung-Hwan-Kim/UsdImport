@@ -97,12 +97,14 @@ const syntaxErrors = linter(
   { delay: 400 },
 );
 
-/** Everything a script tab's EditorState needs; `onSave` runs on Ctrl/Cmd+S. */
+/** Everything a script tab's EditorState needs; `onSave` runs on Ctrl/Cmd+S, `onRun` on Ctrl/Cmd+Enter (as in Isaac Sim's Script Editor). */
 export function scriptExtensions({
   onSave,
+  onRun,
   onChange,
 }: {
   onSave: () => void;
+  onRun: () => void;
   onChange: (state: EditorState, docChanged: boolean) => void;
 }): Extension[] {
   return [
@@ -135,6 +137,14 @@ export function scriptExtensions({
         preventDefault: true,
         run: () => {
           onSave();
+          return true;
+        },
+      },
+      {
+        key: "Mod-Enter",
+        preventDefault: true,
+        run: () => {
+          onRun();
           return true;
         },
       },

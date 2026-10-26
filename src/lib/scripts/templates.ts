@@ -32,10 +32,13 @@ export const SCRIPT_TEMPLATES: ScriptTemplate[] = [
     fileName: "standalone.py",
     build: (ctx) => `"""Standalone Isaac Sim app: open a USD stage and run its physics.
 
-Run with Isaac Sim's Python, e.g.
+Run it from the viewer's script editor (Ctrl+Enter, Isaac Sim), or with
+Isaac Sim's Python, e.g.
     ./python.sh standalone.py          (Linux)
     python.bat standalone.py           (Windows)
 """
+
+import os
 
 from isaacsim import SimulationApp
 
@@ -46,7 +49,8 @@ import isaacsim.core.experimental.utils.stage as stage_utils
 import omni.timeline
 from isaacsim.core.simulation_manager import SimulationManager
 
-USD_PATH = "${stagePath(ctx)}"  # TODO: absolute path to the stage
+# Run from the viewer, USD_VIEWER_STAGE is a copy of the stage open there.
+USD_PATH = os.environ.get("USD_VIEWER_STAGE") or "${stagePath(ctx)}"  # TODO: absolute path to the stage
 
 ok, stage = stage_utils.open_stage(USD_PATH)
 if not ok:
@@ -115,7 +119,7 @@ simulation_app.close()
     title: "Script Editor 스니펫",
     hint: "Window › Script Editor",
     fileName: "inspect_stage.py",
-    build: (ctx) => `# Paste into Isaac Sim's Script Editor (Window > Script Editor) and run.
+    build: (ctx) => `# Run from the viewer (Ctrl+Enter), or paste into Isaac Sim's Script Editor (Window > Script Editor).
 # Lists the open stage's rigid bodies and colliders.
 
 import omni.usd
@@ -162,7 +166,9 @@ print("rigid body:", PRIM_PATH)
     title: "World 기반 스크립트",
     hint: "Isaac Sim 4.5–5.x",
     fileName: "world_legacy.py",
-    build: (ctx) => `from isaacsim import SimulationApp
+    build: (ctx) => `import os
+
+from isaacsim import SimulationApp
 
 simulation_app = SimulationApp({"headless": False})
 
@@ -171,7 +177,8 @@ from isaacsim.core.utils.stage import add_reference_to_stage
 
 world = World(stage_units_in_meters=1.0)
 world.scene.add_default_ground_plane()
-add_reference_to_stage(usd_path="${stagePath(ctx)}", prim_path="/World/Asset")  # TODO: absolute path
+# Run from the viewer, USD_VIEWER_STAGE is a copy of the stage open there.
+add_reference_to_stage(usd_path=os.environ.get("USD_VIEWER_STAGE") or "${stagePath(ctx)}", prim_path="/World/Asset")  # TODO: absolute path
 world.reset()
 
 for i in range(600):

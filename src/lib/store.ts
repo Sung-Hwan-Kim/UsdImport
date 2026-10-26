@@ -97,7 +97,8 @@ interface ViewerState {
   canvas: HTMLCanvasElement | null;
   saveDialog: boolean;
 
-  openSource(source: AssetSource, rootPath: string, candidates?: string[]): Promise<void>;
+  /** `keepView` reloads in place (camera unchanged), e.g. after a script changed the stage. */
+  openSource(source: AssetSource, rootPath: string, candidates?: string[], options?: { keepView?: boolean }): Promise<void>;
   openFiles(files: LocalFile[]): Promise<void>;
   openFileList(list: FileList): Promise<void>;
   openUrl(url: string): Promise<void>;
@@ -172,7 +173,7 @@ export const useViewer = create<ViewerState>()(
       saveDialog: false,
       canvas: null,
 
-      async openSource(source, rootPath, candidates = [rootPath]) {
+      async openSource(source, rootPath, candidates = [rootPath], options = {}) {
         const token = ++loadToken;
         set({ loading: true, progress: "불러오는 중…", error: null });
         try {
@@ -193,12 +194,12 @@ export const useViewer = create<ViewerState>()(
             loading: false,
             progress: "",
             selected: null,
-            bounds: null,
+            bounds: options.keepView ? s.bounds : null,
             session: { source, rootPath, candidates },
             animation: { ...s.animation, playing: autoplay, time: 0, duration },
             // The previous stage's runner disposes its engine when it unmounts.
             physics: { ...INITIAL_PHYSICS, speed: s.physics.speed, command: s.physics.command },
-            focus: { target: "stage", reset: true, nonce: s.focus.nonce + 1 },
+            focus: options.keepView ? s.focus : { target: "stage", reset: true, nonce: s.focus.nonce + 1 },
           }));
           // Free GPU resources once the old scene has left the render tree.
           if (previous) setTimeout(() => disposeStage(previous), 500);

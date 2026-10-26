@@ -28,6 +28,7 @@ npm run build && npm start
 | `Space` | 애니메이션 재생/정지 (물리 스테이지에서는 물리 시뮬레이션과 함께 재생/정지) |
 | `P` / `Shift+R` | 물리 재생·일시정지 / 리셋 |
 | `E` | Isaac Sim 스크립트 에디터 열기/닫기 |
+| `Ctrl+Enter` | (스크립트 에디터에서) 스크립트 실행 |
 | `Ctrl+S` | 스테이지 저장 (USDA · USDC · USD) |
 | `↑↓←→` | 계층 트리 탐색 |
 
@@ -93,7 +94,21 @@ npm run build && npm start
 - **문법 검사**: Python 문법 오류를 줄에 표시하고 상태 표시줄에 개수를 보여 줍니다
 - **프림 경로 삽입**: 뷰어에서 선택한 프림의 경로를 커서 위치에 넣습니다
 
-스크립트 실행은 Isaac Sim에서 합니다(Standalone은 `python.sh` / `python.bat`, 스니펫은 Window › Script Editor).
+### 실행
+
+**실행** 버튼이나 `Ctrl+Enter`로 지금 열린 스테이지에 스크립트를 실행합니다. 로컬 서버(`npm run newton`,
+[server/newton/README.md](server/newton/README.md#스크립트-실행))가 실행하고, 출력은 에디터 아래 출력 창에 실시간으로 나옵니다.
+스크립트가 스테이지를 바꾸면 뷰어가 카메라를 그대로 둔 채 다시 불러옵니다(파일에 남기려면 스테이지 저장).
+실행 버튼 옆 메뉴에서 방식을 고릅니다.
+
+| 방식 | 동작 |
+|---|---|
+| **자동** (기본) | `SimulationApp`이나 `isaacsim` · `carb` · `omni.usd` 밖의 `omni.*`를 쓰면 Isaac Sim, 아니면 pxr |
+| **pxr** | OpenUSD만으로 1초 안팎에 실행합니다. `omni.usd.get_context().get_stage()`가 열린 스테이지이고, 다른 Isaac Sim API는 쓸 수 없습니다 |
+| **Isaac Sim** | 이 PC의 Isaac Sim으로 실행합니다(서버가 설치 폴더를 찾거나 `--isaac-sim`으로 지정). Script Editor 스니펫은 헤드리스 Isaac Sim이 열린 스테이지에서 실행하고(기동 10–40초), `SimulationApp`을 띄우는 Standalone 스크립트는 그대로 실행합니다. Standalone에서는 뷰어 스테이지의 경로가 환경 변수 `USD_VIEWER_STAGE`에 있습니다(Standalone 템플릿이 사용) |
+
+실행 중에는 **중지**로 스크립트와 Isaac Sim을 끝낼 수 있습니다. 스크립트 실행은 이 PC에서 연 뷰어 페이지에서만 허용됩니다.
+Isaac Sim에서 직접 실행할 수도 있습니다(Standalone은 `python.sh` / `python.bat`, 스니펫은 Window › Script Editor).
 
 ## 지원 기능
 
@@ -125,9 +140,9 @@ src/lib/physics/
   physx/          PhysX WASM 백엔드 (타입 래퍼 px.ts, physxEngine.ts)
   newton/         Newton 서버 클라이언트 (WebSocket)
 src/lib/usd/sdf/  저장용 무손실 USD 레이어 모델: USDA 읽기/쓰기, USDC(Crate) 읽기/쓰기, 압축, 편집 적용
-src/lib/scripts/  스크립트 에디터: CodeMirror 설정, Isaac Sim API 자동완성 카탈로그, 템플릿, 파일 열기/저장
+src/lib/scripts/  스크립트 에디터: CodeMirror 설정, Isaac Sim API 자동완성 카탈로그, 템플릿, 파일 열기/저장, 서버 실행(run.ts)
 src/components/   뷰어 UI(계층, 인스펙터, 툴바, 애니메이션 바, 물리 바, 스크립트 에디터)와 R3F 뷰포트(PhysicsRunner, ColliderOverlay)
-server/newton/    Newton 물리 서버 (Python, WebSocket)
+server/newton/    로컬 서버 (Python, WebSocket): Newton 물리, OpenUSD 저장, 스크립트 실행(scripts.py, runners/)
 scripts/generate_samples.py   public/samples 생성 스크립트 (`pip install usd-core pillow` 필요)
 ```
 

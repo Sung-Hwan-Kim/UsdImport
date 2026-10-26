@@ -99,6 +99,41 @@ export class MemorySource extends IndexedSource<Uint8Array> {
   }
 }
 
+/** Another source with some files replaced, e.g. a root layer a script rewrote. */
+export class OverlaySource implements AssetSource {
+  readonly label: string;
+  private readonly base: AssetSource;
+  private readonly files = new Map<string, Uint8Array>();
+
+  constructor(base: AssetSource, files: Record<string, Uint8Array>) {
+    // Stack overlays flat, so repeated script runs do not chain sources.
+    if (base instanceof OverlaySource) {
+      this.base = base.base;
+      for (const [path, bytes] of base.files) this.files.set(path, bytes);
+    } else {
+      this.base = base;
+    }
+    this.label = this.base.label;
+    for (const [path, bytes] of Object.entries(files)) this.files.set(this.base.resolve(path) ?? normalizePath(path), bytes);
+  }
+
+  resolve(path: string): string | null {
+    const resolved = this.base.resolve(path);
+    if (resolved) return resolved;
+    const normalized = normalizePath(path);
+    return this.files.has(normalized) ? normalized : null;
+  }
+
+  async read(path: string): Promise<Uint8Array | null> {
+    const key = this.resolve(path);
+    return (key && this.files.get(key)) || this.base.read(path);
+  }
+
+  list(): string[] {
+    return [...new Set([...this.base.list(), ...this.files.keys()])];
+  }
+}
+
 /** Reads relative to the origin of a base URL; paths are URL pathnames. */
 export class HttpSource implements AssetSource {
   constructor(

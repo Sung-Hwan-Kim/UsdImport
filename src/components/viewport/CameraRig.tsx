@@ -15,6 +15,7 @@ export default function CameraRig() {
   const focus = useViewer((s) => s.focus);
   const bounds = useViewer((s) => s.bounds);
   const autoRotate = useViewer((s) => s.settings.autoRotate);
+  const framed = useRef<number | null>(null);
 
   // Frame the stage (or selection) whenever a focus request comes in. Initial
   // framing waits for the stage bounds, which StageModel publishes on mount.
@@ -22,6 +23,9 @@ export default function CameraRig() {
     const c = controls.current;
     const { stage, selected } = useViewer.getState();
     if (!c || !stage || !bounds) return;
+    // A reload that keeps the view brings new bounds but no new focus request.
+    if (framed.current === focus.nonce) return;
+    framed.current = focus.nonce;
     const target = focus.target === "selection" && selected ? selected : stage.scene;
     const sphere = computeBounds(target).getBoundingSphere(new Sphere());
     const r = Math.max(sphere.radius, 1e-4);

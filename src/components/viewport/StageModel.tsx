@@ -17,7 +17,7 @@ export default function StageModel({ stage }: { stage: LoadedStage }) {
   const requestFocus = useViewer((s) => s.requestFocus);
   const setBounds = useViewer((s) => s.setBounds);
   const bounds = useViewer((s) => s.bounds);
-  const axisInitialized = useRef(false);
+  const framedAxis = useRef<string | null>(null);
 
   // Up-axis: the composer already rotates Z-up stages; allow overriding it.
   useLayoutEffect(() => {
@@ -32,8 +32,9 @@ export default function StageModel({ stage }: { stage: LoadedStage }) {
       radius: Math.max(sphere.radius, 1e-4),
       floorY: box.min.y,
     });
-    if (axisInitialized.current) requestFocus("stage", true);
-    axisInitialized.current = true;
+    // Reframe when the axis setting changes, not when the effect re-runs (StrictMode, a reload keeping the view).
+    if (framedAxis.current !== null && framedAxis.current !== upAxis) requestFocus("stage", true);
+    framedAxis.current = upAxis;
   }, [stage, upAxis, setBounds, requestFocus]);
 
   useLayoutEffect(() => applyShading(stage.scene, shading), [stage, shading]);
