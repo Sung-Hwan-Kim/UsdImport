@@ -51,6 +51,11 @@ CLOTH_DRAG_RADIUS = 0.05
 MAX_GRABBED_PARTICLES = 64
 # Linear air drag on cloth (1/s). Without it a swinging cloth barely loses energy.
 CLOTH_AIR_DRAG = 1.5
+# Dynamic bodies that start interpenetrating deeper than this (m) ignore each other
+# until they separate; XPBD would push them apart violently.
+INITIAL_OVERLAP = 0.005
+# A drive force limit at or above this is treated as none (UsdPhysics' default is FLT_MAX).
+UNLIMITED_FORCE = 1.0e30
 
 
 @wp.kernel
@@ -136,6 +141,103 @@ def air_drag(
     particle_f[i] = particle_f[i] - particle_mass[i] * drag * particle_qd[i]
 
 
+@wp.func
+def joint_coordinate(X_wp: wp.transform, X_wc: wp.transform, angular: int, dim: int) -> float:
+    """The coordinate SolverXPBD drives along one joint frame axis (as in its solve_body_joints)."""
+    if angular == 0:
+        return wp.transform_get_translation(wp.transform_inverse(X_wp) * X_wc)[dim]
+    q_p = wp.transform_get_rotation(X_wp)
+    q_c = wp.transform_get_rotation(X_wc)
+    if wp.dot(q_p, q_c) < 0.0:
+        q_c = -q_c
+    rel_q = wp.quat_inverse(q_p) * q_c
+    # Twist about the frame's x axis, then the swing's y/z components scaled to angles.
+    # A half-turn swing has no twist component; keep it finite (the solver itself is singular there).
+    qtwist = wp.quat_identity()
+    if rel_q[0] * rel_q[0] + rel_q[3] * rel_q[3] > 1.0e-12:
+        qtwist = wp.normalize(wp.quat(rel_q[0], 0.0, 0.0, rel_q[3]))
+    if dim == 0:
+        return 2.0 * wp.asin(wp.clamp(qtwist[0], -1.0, 1.0))
+    qswing = rel_q * wp.quat_inverse(qtwist)
+    e = qswing[dim]
+    if qswing[3] * qswing[3] + 1.0e-4 < 1.0:
+        e *= 2.0 * wp.acos(wp.clamp(qswing[3], -1.0, 1.0)) / wp.sqrt(1.0 - qswing[3] * qswing[3])
+    return e
+
+
+@wp.kernel
+def limit_drive_force(
+    body_q: wp.array(dtype=wp.transform),
+    body_qd: wp.array(dtype=wp.spatial_vector),
+    body_com: wp.array(dtype=wp.vec3),
+    joint_parent: wp.array(dtype=int),
+    joint_child: wp.array(dtype=int),
+    joint_X_p: wp.array(dtype=wp.transform),
+    joint_X_c: wp.array(dtype=wp.transform),
+    dof_joint: wp.array(dtype=int),
+    dof_angular: wp.array(dtype=int),
+    dof_dim: wp.array(dtype=int),
+    dof_sign: wp.array(dtype=float),
+    dof_target: wp.array(dtype=int),
+    dof_axis: wp.array(dtype=int),
+    dof_reach: wp.array(dtype=float),
+    dof_goal: wp.array(dtype=float),
+    dof_goal_velocity: wp.array(dtype=float),
+    joint_target_ke: wp.array(dtype=float),
+    joint_target_kd: wp.array(dtype=float),
+    gain: float,
+    joint_target_q: wp.array(dtype=float),
+    joint_target_qd: wp.array(dtype=float),
+):
+    """Hold a drive to its force limit, which SolverXPBD ignores (joint_effort_limit).
+
+    PhysX clamps a drive's spring plus damping force, so a target that jumps
+    (an animated hand teleported between poses) pulls with at most maxForce.
+    A linear drive over its limit gets a target that much ahead of the body
+    and its current velocity as target velocity (no damping). XPBD reapplies a
+    drive's correction every iteration, so the offset is divided by `gain`
+    (iterations x relaxation) for a PhysX-like acceleration; harder pulls swing
+    a light body around its anchor and flip it. An angular drive only keeps its
+    target within maxForce/stiffness and keeps its damping, since its coordinate
+    wraps at half turns. Runs every substep before the solver.
+    """
+    i = wp.tid()
+    j = dof_joint[i]
+    X_wp = joint_X_p[j]
+    p = joint_parent[j]
+    com_p = wp.vec3(0.0)
+    qd_p = wp.spatial_vector()
+    if p >= 0:
+        X_wp = body_q[p] * X_wp
+        com_p = wp.transform_point(body_q[p], body_com[p])
+        qd_p = body_qd[p]
+    c = joint_child[j]
+    X_wc = body_q[c] * joint_X_c[j]
+    dim = dof_dim[i]
+    sign = dof_sign[i]
+    q = sign * joint_coordinate(X_wp, X_wc, dof_angular[i], dim)
+    reach = dof_reach[i]
+    error = dof_goal[i] - q
+    if dof_angular[i] == 1:
+        joint_target_q[dof_target[i]] = q + wp.clamp(error, -reach, reach)
+        return
+    d = dof_axis[i]
+    axis = wp.quat_rotate(wp.transform_get_rotation(X_wp), wp.vec3(float(dim == 0), float(dim == 1), float(dim == 2)))
+    qd_c = body_qd[c]
+    r_c = wp.transform_get_translation(X_wc) - wp.transform_point(body_q[c], body_com[c])
+    r_p = wp.transform_get_translation(X_wp) - com_p
+    v_c = wp.spatial_top(qd_c) + wp.cross(wp.spatial_bottom(qd_c), r_c)
+    v_p = wp.spatial_top(qd_p) + wp.cross(wp.spatial_bottom(qd_p), r_p)
+    v = sign * wp.dot(v_c - v_p, axis)
+    force_over_ke = error + joint_target_kd[d] / joint_target_ke[d] * (dof_goal_velocity[i] - v)
+    if wp.abs(force_over_ke) <= reach:
+        joint_target_q[dof_target[i]] = dof_goal[i]
+        joint_target_qd[d] = dof_goal_velocity[i]
+    else:
+        joint_target_q[dof_target[i]] = q + wp.sign(force_over_ke) * reach / gain
+        joint_target_qd[d] = v
+
+
 def _has_rigid_body(prim: Usd.Prim) -> bool:
     while prim and prim.IsValid() and not prim.IsPseudoRoot():
         if prim.HasAPI(UsdPhysics.RigidBodyAPI):
@@ -206,6 +308,143 @@ def free_unlimited_generic_axes(stage: Usd.Stage) -> None:
             limit = UsdPhysics.LimitAPI.Apply(prim, dof)
             limit.CreateLowAttr(-math.inf)
             limit.CreateHighAttr(math.inf)
+
+
+def restore_world_joint_frames(stage: Usd.Stage, builder: newton.ModelBuilder, joint_map: dict[str, int]) -> list[int]:
+    """Put back the authored world-side frame of joints between a body and the world.
+
+    UsdPhysics (and PhysX) read localPos/localRot of a side without a body as
+    world coordinates. Newton 1.7 rebuilds that frame from the child body's
+    pose instead, so a joint anchored elsewhere, e.g. at the origin with
+    absolute drive targets, starts with its targets offset by the body's
+    position. Returns the joints whose frame was restored.
+    """
+    owners: dict[int, list[str]] = {}
+    for path, j in joint_map.items():
+        owners.setdefault(j, []).append(path)
+    restored = []
+    for j, paths in owners.items():
+        # Stacked joints merged into one keep Newton's frame: their axes are relative to it.
+        if builder.joint_parent[j] != -1 or len(paths) != 1:
+            continue
+        joint = UsdPhysics.Joint(stage.GetPrimAtPath(paths[0]))
+        if not joint:
+            continue
+        sides = [
+            (joint.GetBody0Rel(), joint.GetLocalPos0Attr(), joint.GetLocalRot0Attr()),
+            (joint.GetBody1Rel(), joint.GetLocalPos1Attr(), joint.GetLocalRot1Attr()),
+        ]
+        world = [side for side in sides if side[0].GetTargets() in ([], [Sdf.Path.absoluteRootPath])]
+        if len(world) != 1:
+            continue
+        _, pos_attr, rot_attr = world[0]
+        pos = pos_attr.Get() if pos_attr.HasAuthoredValue() else Gf.Vec3f(0.0)
+        rot = rot_attr.Get() if rot_attr.HasAuthoredValue() else Gf.Quatf(1.0)
+        im = rot.GetImaginary()
+        builder.joint_X_p[j] = wp.transform(wp.vec3(*pos), wp.quat(im[0], im[1], im[2], rot.GetReal()))
+        restored.append(j)
+    return restored
+
+
+def disable_unpowered_drives(builder: newton.ModelBuilder) -> None:
+    """Switch off drives whose force limit is zero; PhysX applies no force for them, XPBD ignores the limit."""
+    for d, limit in enumerate(builder.joint_effort_limit):
+        if limit <= 0.0:
+            builder.joint_target_ke[d] = 0.0
+            builder.joint_target_kd[d] = 0.0
+
+
+def match_joint_coordinates(model: newton.Model, joints: list[int]) -> None:
+    """Recompute joint_q of articulated joints from the imported body poses (after their frames changed)."""
+    if not joints or not model.articulation_count:
+        return
+    articulation = model.joint_articulation.numpy()
+    joints = [j for j in joints if articulation[j] >= 0]
+    if not joints:
+        return
+    q = wp.clone(model.joint_q)
+    qd = wp.clone(model.joint_qd)
+    newton.eval_ik(model, model, q, qd)
+    starts = model.joint_q_start.numpy()
+    joint_q, solved = model.joint_q.numpy(), q.numpy()
+    for j in joints:
+        joint_q[starts[j] : starts[j + 1]] = solved[starts[j] : starts[j + 1]]
+    model.joint_q.assign(joint_q)
+
+
+def force_limited_dofs(model: newton.Model) -> list[tuple[int, int, int, float, int, int, float]]:
+    """Drive axes with a finite force limit, as (joint, angular, dim, sign, target index, axis index, maxForce / stiffness).
+
+    dim/sign locate the axis in the joint frame; axes that are not one of its
+    basis vectors are left unlimited.
+    """
+    kinds = model.joint_type.numpy()
+    dims = model.joint_dof_dim.numpy()
+    qd_starts = model.joint_qd_start.numpy()
+    target_starts = model.joint_target_q_start.numpy()
+    axes = model.joint_axis.numpy()
+    ke = model.joint_target_ke.numpy()
+    limits = model.joint_effort_limit.numpy()
+    driven = (int(newton.JointType.REVOLUTE), int(newton.JointType.PRISMATIC), int(newton.JointType.D6))
+    rows = []
+    for j in range(model.joint_count):
+        if kinds[j] not in driven:
+            continue
+        lin, ang = dims[j]
+        for k in range(lin + ang):
+            d = int(qd_starts[j]) + k
+            if ke[d] <= 0.0 or not 0.0 < limits[d] < UNLIMITED_FORCE:
+                continue
+            dim = int(np.argmax(np.abs(axes[d])))
+            if abs(axes[d][dim]) < 0.999:
+                continue
+            rows.append((j, int(k >= lin), dim, float(np.sign(axes[d][dim])), int(target_starts[j]) + k, d, float(limits[d] / ke[d])))
+    return rows
+
+
+class StableXPBD(newton.solvers.SolverXPBD):
+    """SolverXPBD with two PhysX-like changes that keep densely jointed, light stages stable.
+
+    - Joint corrections are averaged per body beyond two joints. XPBD sums every
+      joint's correction (Jacobi), which overshoots on a body held by many joints
+      (a paper box grid has 4 to 24 per tile) and diverges. Contacts are already
+      averaged this way; bodies with one or two joints are unchanged.
+    - No gyroscopic term, PhysX's default. Newton integrates it explicitly, which
+      grows a thin body's wobble without bound once it spins about its long axis.
+
+    Both hook SolverXPBD internals of Newton 1.7 (pinned in requirements.txt).
+    """
+
+    def __init__(self, model: newton.Model, **kwargs):
+        super().__init__(model, **kwargs)
+        count = np.zeros(model.body_count)
+        kinds, enabled = model.joint_type.numpy(), model.joint_enabled.numpy()
+        for p, c, kind, on in zip(model.joint_parent.numpy(), model.joint_child.numpy(), kinds, enabled):
+            if on and kind != int(newton.JointType.FREE):
+                count[[b for b in (p, c) if b >= 0]] += 1
+        # apply_body_deltas divides a body's correction by its weight; 0 means 1.
+        self.joint_weight = wp.array(np.where(count > 2, count / 2, 0.0), dtype=float, device=model.device)
+        self.no_inertia = wp.zeros_like(model.body_inertia)
+
+    def _without_gyroscopic(self, fn, *args):
+        # These kernels use the inertia (not its inverse) only for the gyroscopic term.
+        model = self.model
+        inertia, model.body_inertia = model.body_inertia, self.no_inertia
+        try:
+            return fn(*args)
+        finally:
+            model.body_inertia = inertia
+
+    def integrate_bodies(self, model, state_in, state_out, dt, angular_damping=0.0):
+        return self._without_gyroscopic(super().integrate_bodies, model, state_in, state_out, dt, angular_damping)
+
+    def _apply_body_deltas(self, model, state_in, state_out, body_deltas, dt, rigid_contact_inv_weight=None):
+        # Contacts always pass their weights (rigid_contact_con_weighting); joints pass none.
+        if rigid_contact_inv_weight is None:
+            rigid_contact_inv_weight = self.joint_weight
+        return self._without_gyroscopic(
+            super()._apply_body_deltas, model, state_in, state_out, body_deltas, dt, rigid_contact_inv_weight
+        )
 
 
 def _sampled(attr: Usd.Attribute) -> tuple[np.ndarray, np.ndarray] | None:
@@ -345,6 +584,8 @@ class Simulation:
                 stage, load_visual_shapes=False, apply_up_axis_from_stage=False, return_deformable_results=True
             )
         pinned, problems = pin_cloth_attachments(stage, builder, result)
+        restored = restore_world_joint_frames(stage, builder, result.get("path_joint_map", {}))
+        disable_unpowered_drives(builder)
         # Drop the importer's "attachment not imported" notes for attachments handled above.
         messages = {str(w.message) for w in caught}
         self.warnings = sorted({m for m in messages if not any(m.startswith(p + ":") for p in pinned)} | set(problems))
@@ -377,6 +618,7 @@ class Simulation:
         # so only the reduced-coordinate solvers need that validation.
         with wp.ScopedDevice(self.device):
             self.model = builder.finalize(device=self.device, skip_validation_joints=solver != "mujoco")
+            match_joint_coordinates(self.model, restored)
         if self.model.body_count == 0 and not self.cloths:
             raise RuntimeError("시뮬레이션할 리지드 바디나 천이 없습니다.")
 
@@ -412,7 +654,7 @@ class Simulation:
                 particle_self_contact_gap=CLOTH_SELF_CONTACT_GAP / unit,
             )
         else:
-            self.solver = newton.solvers.SolverXPBD(self.model, iterations=8, enable_restitution=True)
+            self.solver = StableXPBD(self.model, iterations=8, enable_restitution=True)
 
         # Captured CUDA graphs ping-pong state_0/state_1, so keep the substep count even.
         if solver == "vbd":
@@ -443,11 +685,38 @@ class Simulation:
                 self.state_0.body_q.assign(body_q)
             self.initial = self.model.state()
             self.initial.assign(self.state_0)
-            if self.cloths:
-                self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=CLOTH_CONTACT_GAP / self.meters_per_unit)
-            else:
-                self.pipeline = newton.CollisionPipeline(self.model)
+            pipeline_options = {"soft_contact_gap": CLOTH_CONTACT_GAP / self.meters_per_unit} if self.cloths else {}
+            self.pipeline = newton.CollisionPipeline(self.model, **pipeline_options)
             self.contacts = self.pipeline.contacts()
+            # The automatic contact capacity can be too small for many touching shapes
+            # (contacts past it are dropped); measure the start and leave headroom.
+            self.pipeline.collide(self.state_0, self.contacts)
+            needed = int(self.contacts.rigid_contact_count.numpy()[0])
+            if needed > self.contacts.rigid_contact_max:
+                self.pipeline = newton.CollisionPipeline(self.model, rigid_contact_max=2 * needed, **pipeline_options)
+                self.contacts = self.pipeline.contacts()
+                self.pipeline.collide(self.state_0, self.contacts)
+            self._ignore_initial_overlaps()
+
+            # Drive force limits, which SolverXPBD would ignore (see limit_drive_force).
+            limited = force_limited_dofs(self.model) if solver == "xpbd" else []
+            self.limited = len(limited)
+            if limited:
+                joint, angular, dim, sign, target, axis, reach = (list(column) for column in zip(*limited))
+                self.limited_inputs = [
+                    wp.array(joint, dtype=int),
+                    wp.array(angular, dtype=int),
+                    wp.array(dim, dtype=int),
+                    wp.array(sign, dtype=float),
+                    wp.array(target, dtype=int),
+                    wp.array(axis, dtype=int),
+                    wp.array(reach, dtype=float),
+                ]
+                # The authored targets; every substep writes the limited ones into the control.
+                self.limited_targets = np.array(target)
+                self.limited_axes = np.array(axis)
+                self.limited_goal = wp.array(self.control.joint_target_q.numpy()[self.limited_targets], dtype=float)
+                self.limited_goal_velocity = wp.array(self.control.joint_target_qd.numpy()[self.limited_axes], dtype=float)
             self.drag_body = wp.array([-1], dtype=int)
             self.drag_points = wp.zeros(2, dtype=wp.vec3)
             # The grabbed cloth patch: particles, their offsets from the grabbed one, the target.
@@ -525,6 +794,28 @@ class Simulation:
                     outputs=[self.state_0.particle_f],
                     device=self.device,
                 )
+            if self.limited:
+                wp.launch(
+                    limit_drive_force,
+                    dim=self.limited,
+                    inputs=[
+                        self.state_0.body_q,
+                        self.state_0.body_qd,
+                        self.model.body_com,
+                        self.model.joint_parent,
+                        self.model.joint_child,
+                        self.model.joint_X_p,
+                        self.model.joint_X_c,
+                        *self.limited_inputs,
+                        self.limited_goal,
+                        self.limited_goal_velocity,
+                        self.model.joint_target_ke,
+                        self.model.joint_target_kd,
+                        self.solver.iterations * self.solver.joint_linear_relaxation,
+                    ],
+                    outputs=[self.control.joint_target_q, self.control.joint_target_qd],
+                    device=self.device,
+                )
             self.pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
@@ -539,6 +830,9 @@ class Simulation:
                 target[track["index"]] = np.interp(end, track["times"], track["values"])
             self.control.joint_target_q.assign(self.target_q)
             self.control.joint_target_qd.assign(self.target_qd)
+            if self.limited:
+                self.limited_goal.assign(self.target_q[self.limited_targets])
+                self.limited_goal_velocity.assign(self.target_qd[self.limited_axes])
         if self.kinematic:
             starts = np.array([_body_pose(prim, start) for _, prim in self.kinematic])
             ends = np.array([_body_pose(prim, end) for _, prim in self.kinematic])
@@ -567,6 +861,8 @@ class Simulation:
             else:
                 self._simulate()
         self.sim_time += self.frame_dt
+        if self.ignored:
+            self._restore_separated_pairs()
 
     def reset(self) -> None:
         with wp.ScopedDevice(self.device):
@@ -574,6 +870,76 @@ class Simulation:
             self.state_0.assign(self.initial)
             self.state_1.assign(self.initial)
         self.sim_time = 0.0
+        if self.overlaps:
+            # Back at the start the bodies overlap again.
+            pairs = self.model.shape_contact_pairs.numpy()
+            for indices, original in self.overlaps:
+                pairs[indices, 1] = original[:, 0]
+            self.model.shape_contact_pairs.assign(pairs)
+            self.ignored = list(self.overlaps)
+
+    def _ignore_initial_overlaps(self) -> None:
+        """Let dynamic bodies that start deeply interpenetrating pass through each other until they separate.
+
+        PhysX sorts out such a start (two tools parked in one spot) within a few
+        steps; XPBD's position correction flings them apart hard enough to flip
+        and explode light bodies. A disabled pair stays in the explicit broad
+        phase's pair list as (a, a), which it skips as a same-body pair, so the
+        captured CUDA graph is unaffected. Needs a collide() on the start state.
+        """
+        # (indices into model.shape_contact_pairs, their original pairs), per body pair
+        self.overlaps: list[tuple[np.ndarray, np.ndarray]] = []
+        self.ignored: list[tuple[np.ndarray, np.ndarray]] = []
+        if self.pipeline.broad_phase_mode != "explicit" or getattr(self.model, "shape_contact_pairs", None) is None:
+            return
+        c = self.contacts
+        n = min(int(c.rigid_contact_count.numpy()[0]), c.rigid_contact_max)
+        shape_body = self.model.shape_body.numpy()
+        body0, body1 = shape_body[c.rigid_contact_shape0.numpy()[:n]], shape_body[c.rigid_contact_shape1.numpy()[:n]]
+        moving = (self.model.body_inv_mass.numpy() > 0.0) & (self.model.body_flags.numpy() & int(newton.BodyFlags.KINEMATIC) == 0)
+        candidates = np.where((body0 >= 0) & (body1 >= 0) & (body0 != body1))[0]
+        candidates = candidates[moving[body0[candidates]] & moving[body1[candidates]]]
+        if not len(candidates):
+            return
+        body_q = self.state_0.body_q.numpy().astype(np.float64)
+        point0, point1 = c.rigid_contact_point0.numpy(), c.rigid_contact_point1.numpy()
+        normal = c.rigid_contact_normal.numpy()
+        margin = c.rigid_contact_margin0.numpy() + c.rigid_contact_margin1.numpy()
+        overlapping = set()
+        for i in candidates:
+            a, b = body0[i], body1[i]
+            world0 = body_q[a, :3] + _rotate(body_q[a, 3:], point0[i])
+            world1 = body_q[b, :3] + _rotate(body_q[b, 3:], point1[i])
+            if np.dot(world1 - world0, normal[i]) - margin[i] < -INITIAL_OVERLAP / self.meters_per_unit:
+                overlapping.add((min(a, b), max(a, b)))
+        if not overlapping:
+            return
+        pairs = self.model.shape_contact_pairs.numpy()
+        bodies = np.sort(shape_body[pairs], axis=1)
+        for a, b in sorted(overlapping):
+            indices = np.where((bodies[:, 0] == a) & (bodies[:, 1] == b))[0]
+            self.overlaps.append((indices, pairs[indices].copy()))
+            pairs[indices, 1] = pairs[indices, 0]
+            self.warnings.append(f"{self.bodies[a]}, {self.bodies[b]}: 처음부터 깊이 겹쳐 있어 서로 떨어질 때까지 충돌하지 않습니다.")
+        self.model.shape_contact_pairs.assign(pairs)
+        self.ignored = list(self.overlaps)
+
+    def _restore_separated_pairs(self) -> None:
+        """Let ignored body pairs collide again once none of their shapes' bounding boxes overlap."""
+        lower = self.pipeline.narrow_phase.shape_aabb_lower.numpy()
+        upper = self.pipeline.narrow_phase.shape_aabb_upper.numpy()
+        apart, still = [], []
+        for indices, original in self.ignored:
+            a, b = original[:, 0], original[:, 1]
+            touching = np.any(np.all((lower[a] <= upper[b]) & (lower[b] <= upper[a]), axis=1))
+            (still if touching else apart).append((indices, original))
+        if not apart:
+            return
+        pairs = self.model.shape_contact_pairs.numpy()
+        for indices, original in apart:
+            pairs[indices] = original
+        self.model.shape_contact_pairs.assign(pairs)
+        self.ignored = still
 
     def set_drag(self, body: int, local: list[float], target: list[float]) -> None:
         if not 0 <= body < len(self.bodies):
