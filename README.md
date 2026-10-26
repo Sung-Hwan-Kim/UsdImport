@@ -27,6 +27,7 @@ npm run build && npm start
 | `G` `L` `R` | 그리드 · USD 라이트 · 자동 회전 |
 | `Space` | 애니메이션 재생/정지 |
 | `P` / `Shift+R` | 물리 재생·일시정지 / 리셋 |
+| `E` | Isaac Sim 스크립트 에디터 열기/닫기 |
 | `↑↓←→` | 계층 트리 탐색 |
 
 ## 물리 시뮬레이션
@@ -51,6 +52,22 @@ npm run build && npm start
 
 엔진은 물리 바 왼쪽의 메뉴에서 바꿉니다. 물리 샘플: **Physics Playground**(USDA), **Physics Joints**(USDC), **Dominoes (Z-up, cm)**(USD),
 **Physics Cloth**(USDA, Newton — 식탁보 · 봉에 고정된 커튼 · 공).
+
+## Isaac Sim 스크립트 에디터
+
+상단 바의 `</>` 버튼이나 `E`로 뷰포트 아래에 Python 에디터(CodeMirror 6)를 엽니다. 위쪽 경계를 끌어 높이를 바꾸거나 최대화할 수 있습니다.
+
+- **열기**: 에디터의 열기 버튼, 또는 `.py` 파일을 화면에 끌어다 놓기(USD 파일과 함께 놓아도 각각 처리됩니다). 여러 파일을 탭으로 엽니다
+- **저장**: `Ctrl+S`. Chrome · Edge에서는 연 파일에 바로 덮어쓰고, 새 스크립트는 저장 위치를 묻습니다. 그 밖의 브라우저는 다운로드로 저장합니다.
+  편집 중인 내용은 브라우저에 자동 보관되어 새로고침해도 남습니다
+- **템플릿**: Standalone 앱, Hello World(큐브 떨어뜨리기), Script Editor 스니펫, 선택한 프림을 리지드 바디로, World 기반(Isaac Sim 4.5–5.x).
+  열려 있는 스테이지 파일 이름과 선택한 프림 경로를 채워 넣습니다
+- **자동완성**: Isaac Sim 6.x의 `isaacsim.core.experimental`(stage · prim · xform 유틸, objects, prims, materials), `SimulationApp`,
+  `SimulationManager`, `omni.usd` · `omni.timeline`, `pxr`(Usd · UsdGeom · UsdPhysics · Gf · Sdf)와 이전 버전 이름. `import x as y`로 붙인 별칭도 따라갑니다
+- **문법 검사**: Python 문법 오류를 줄에 표시하고 상태 표시줄에 개수를 보여 줍니다
+- **프림 경로 삽입**: 뷰어에서 선택한 프림의 경로를 커서 위치에 넣습니다
+
+스크립트 실행은 Isaac Sim에서 합니다(Standalone은 `python.sh` / `python.bat`, 스니펫은 Window › Script Editor).
 
 ## 지원 기능
 
@@ -78,7 +95,8 @@ src/lib/physics/
   engine.ts       엔진 공통 인터페이스
   physx/          PhysX WASM 백엔드 (타입 래퍼 px.ts, physxEngine.ts)
   newton/         Newton 서버 클라이언트 (WebSocket)
-src/components/   뷰어 UI(계층, 인스펙터, 툴바, 애니메이션 바, 물리 바)와 R3F 뷰포트(PhysicsRunner, ColliderOverlay)
+src/lib/scripts/  스크립트 에디터: CodeMirror 설정, Isaac Sim API 자동완성 카탈로그, 템플릿, 파일 열기/저장
+src/components/   뷰어 UI(계층, 인스펙터, 툴바, 애니메이션 바, 물리 바, 스크립트 에디터)와 R3F 뷰포트(PhysicsRunner, ColliderOverlay)
 server/newton/    Newton 물리 서버 (Python, WebSocket)
 scripts/generate_samples.py   public/samples 생성 스크립트 (`pip install usd-core pillow` 필요)
 ```

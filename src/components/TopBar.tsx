@@ -1,9 +1,10 @@
 "use client";
 
-import { Camera, CircleHelp, FileUp, FolderOpen, Layers, PanelLeft, PanelRight } from "lucide-react";
+import { Camera, CircleHelp, FileUp, FolderOpen, Layers, PanelLeft, PanelRight, SquareCode } from "lucide-react";
 import { pickLocalFiles } from "@/lib/files";
 import { formatCount } from "@/lib/format";
 import { SAMPLES, sampleUrl } from "@/lib/samples";
+import { useScripts } from "@/lib/scripts/store";
 import { useViewer } from "@/lib/store";
 import Logo from "./Logo";
 import { Badge, Button, IconButton, Kbd, Popover } from "./ui";
@@ -67,6 +68,7 @@ const SHORTCUTS: [string, string][] = [
   ["G / L / R", "그리드 · USD 라이트 · 자동 회전"],
   ["Space", "애니메이션 재생/정지"],
   ["P / Shift+R", "물리 재생·일시정지 / 리셋"],
+  ["E", "Isaac Sim 스크립트 에디터"],
   ["↑ ↓ ← →", "계층 트리 탐색"],
 ];
 
@@ -103,6 +105,8 @@ export default function TopBar() {
   const panels = useViewer((s) => s.panels);
   const togglePanel = useViewer((s) => s.togglePanel);
   const openFiles = useViewer((s) => s.openFiles);
+  const scriptsOpen = useScripts((s) => s.open);
+  const setScriptsOpen = useScripts((s) => s.setOpen);
 
   return (
     <header className="flex h-12 shrink-0 items-center gap-1.5 border-b border-line bg-panel px-2">
@@ -131,6 +135,7 @@ export default function TopBar() {
           <span className="hidden sm:inline">파일 열기</span>
         </Button>
         <div className="mx-1 h-5 w-px bg-line" />
+        <IconButton icon={SquareCode} label="Isaac Sim 스크립트 에디터" shortcut="E" active={scriptsOpen} onClick={() => setScriptsOpen(!scriptsOpen)} />
         <IconButton icon={Camera} label="스크린샷 저장 (PNG)" onClick={saveScreenshot} disabled={!stage} />
         <HelpMenu />
         <IconButton icon={PanelRight} label="속성 패널" active={panels.inspector} onClick={() => togglePanel("inspector")} />

@@ -4,12 +4,15 @@ import { useEffect, useRef, useState } from "react";
 import { filesFromDataTransfer } from "@/lib/files";
 import { SAMPLES, sampleUrl } from "@/lib/samples";
 import type { Shading } from "@/lib/scene";
+import { isScriptFile, openScriptFiles } from "@/lib/scripts/files";
+import { useScripts } from "@/lib/scripts/store";
 import { useViewer } from "@/lib/store";
 import AnimationBar from "./AnimationBar";
 import HierarchyPanel from "./HierarchyPanel";
 import InspectorPanel from "./InspectorPanel";
 import { DropOverlay, EmptyState, ErrorToast, LoadingOverlay, RenderStatsOverlay } from "./Overlays";
 import PhysicsBar from "./PhysicsBar";
+import ScriptEditor from "./ScriptEditor";
 import TopBar from "./TopBar";
 import { cn } from "./ui";
 import Viewport from "./viewport/Viewport";
@@ -44,7 +47,11 @@ function useFileDrop(): boolean {
       depth = 0;
       setDragging(false);
       filesFromDataTransfer(e.dataTransfer).then((files) => {
-        if (files.length) useViewer.getState().openFiles(files);
+        // Python scripts go to the script editor, everything else to the stage loader.
+        const scripts = files.filter((f) => isScriptFile(f.path));
+        const rest = files.filter((f) => !isScriptFile(f.path));
+        if (scripts.length) void openScriptFiles(scripts.map(({ file }) => ({ file })));
+        if (rest.length) useViewer.getState().openFiles(rest);
       });
     };
     window.addEventListener("dragenter", onEnter);
@@ -102,6 +109,11 @@ function useShortcuts() {
         case "KeyP":
           if (s.stage?.metadata.hasPhysics) s.physicsCommand(s.physics.status === "running" ? "pause" : "play");
           break;
+        case "KeyE": {
+          const scripts = useScripts.getState();
+          scripts.setOpen(!scripts.open);
+          break;
+        }
         case "Space":
           if (s.animation.duration > 0) {
             e.preventDefault();
@@ -138,6 +150,7 @@ export default function ViewerApp() {
   const panels = useViewer((s) => s.panels);
   const showStats = useViewer((s) => s.settings.stats);
   const hasAnimation = useViewer((s) => s.animation.duration > 0);
+  const scriptsOpen = useScripts((s) => s.open);
   const dragging = useFileDrop();
   useShortcuts();
   useInitialStage();
@@ -158,16 +171,19 @@ export default function ViewerApp() {
             <HierarchyPanel />
           </aside>
         )}
-        <main className="viewport-bg relative min-w-0 flex-1 overflow-hidden">
-          <Viewport />
-          {stage && <ViewportToolbar />}
-          {!stage && !loading && <EmptyState />}
-          {stage && hasAnimation && <AnimationBar />}
-          {stage?.metadata.hasPhysics && <PhysicsBar raised={hasAnimation} />}
-          {showStats && stage && <RenderStatsOverlay />}
-          {loading && <LoadingOverlay />}
-          <ErrorToast />
-        </main>
+        <div className="relative flex min-w-0 flex-1 flex-col">
+          <main className="viewport-bg relative min-h-0 min-w-0 flex-1 overflow-hidden">
+            <Viewport />
+            {stage && <ViewportToolbar />}
+            {!stage && !loading && <EmptyState />}
+            {stage && hasAnimation && <AnimationBar />}
+            {stage?.metadata.hasPhysics && <PhysicsBar raised={hasAnimation} />}
+            {showStats && stage && <RenderStatsOverlay />}
+            {loading && <LoadingOverlay />}
+            <ErrorToast />
+          </main>
+          {scriptsOpen && <ScriptEditor />}
+        </div>
         {panels.inspector && (
           <aside className={cn(asideClass, "w-80 border-l border-line max-lg:right-0")}>
             <InspectorPanel />
