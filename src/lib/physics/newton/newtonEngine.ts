@@ -2,6 +2,7 @@ import { Object3D, type Mesh, type Vector3 } from "three";
 import { stagePathOf } from "../../scene";
 import type { LoadedStage } from "../../usd/loadStage";
 import type { AssetSource } from "../../usd/sources";
+import { collectStageFiles } from "../../usd/stageFiles";
 import type { ClothBinding, EngineLoadResult, PhysicsEngine } from "../engine";
 
 const CONNECT_TIMEOUT_MS = 5000;
@@ -57,7 +58,7 @@ export class NewtonEngine implements PhysicsEngine {
 
   /** The server parses the USD itself, so the viewer's PhysicsDescription is not needed. */
   async load(stage: LoadedStage): Promise<EngineLoadResult> {
-    const files = await this.collectFiles(stage);
+    const files = await collectStageFiles(stage, this.origin.source, this.origin.rootPath);
     const ws = await this.connect();
 
     const ready = new Promise<ReadyMessage>((resolve, reject) => {
@@ -125,19 +126,6 @@ export class NewtonEngine implements PhysicsEngine {
       label: `Newton · ${msg.device} · ${msg.solver.toUpperCase()}`,
       warnings,
     };
-  }
-
-  /** The files the stage was composed from, read back from the viewer's source. */
-  private async collectFiles(stage: LoadedStage): Promise<{ root: string; entries: { path: string; bytes: Uint8Array }[] }> {
-    const { source, rootPath } = this.origin;
-    const paths = stage.rootFormat === "usdz" ? [rootPath] : [...stage.layers.keys()];
-    const entries: { path: string; bytes: Uint8Array }[] = [];
-    for (const path of paths) {
-      const bytes = await source.read(path);
-      if (bytes) entries.push({ path, bytes });
-    }
-    if (!entries.length) throw new Error("Newton 서버로 보낼 USD 파일을 읽지 못했습니다.");
-    return { root: stage.rootFormat === "usdz" ? rootPath : stage.rootPath, entries };
   }
 
   private connect(): Promise<WebSocket> {

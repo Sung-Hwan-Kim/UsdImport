@@ -1,17 +1,7 @@
+import { download, fileAccess, isAbort, writeFile, type FileType } from "../fileAccess";
 import { useScripts } from "./store";
 
-// File System Access API (Chromium); elsewhere scripts open through an <input> and save as downloads.
-interface PickerType {
-  description: string;
-  accept: Record<string, string[]>;
-}
-interface FileAccessWindow {
-  showOpenFilePicker?(options: { multiple?: boolean; types?: PickerType[] }): Promise<FileSystemFileHandle[]>;
-  showSaveFilePicker?(options: { suggestedName?: string; types?: PickerType[] }): Promise<FileSystemFileHandle>;
-}
-
-const PYTHON: PickerType[] = [{ description: "Python 스크립트", accept: { "text/x-python": [".py"] } }];
-const fileAccess = () => (typeof window === "undefined" ? {} : (window as unknown as FileAccessWindow));
+const PYTHON: FileType[] = [{ description: "Python 스크립트", accept: { "text/x-python": [".py"] } }];
 
 /** Where each open script was read from or last saved to, for saving in place (this session only). */
 const handles = new Map<string, FileSystemFileHandle>();
@@ -20,10 +10,6 @@ export const isScriptFile = (name: string) => /\.pyw?$/i.test(name);
 
 export function hasFileHandle(id: string): boolean {
   return handles.has(id);
-}
-
-function isAbort(e: unknown): boolean {
-  return e instanceof DOMException && e.name === "AbortError";
 }
 
 /** Open text files as scripts, reusing an open tab with the same name and saved content. */
@@ -61,20 +47,6 @@ export async function pickScripts(): Promise<void> {
   input.click();
 }
 
-function download(name: string, content: string): void {
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(new Blob([content], { type: "text/x-python" }));
-  a.download = name;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-}
-
-async function writeTo(handle: FileSystemFileHandle, content: string): Promise<void> {
-  const writable = await handle.createWritable();
-  await writable.write(content);
-  await writable.close();
-}
-
 /**
  * Save a script: in place when it came from (or was saved to) a file this
  * session, otherwise through a save dialog, or as a download where the
@@ -89,14 +61,14 @@ export async function saveScript(id: string, { as = false }: { as?: boolean } = 
     if (!handle) {
       const picker = fileAccess().showSaveFilePicker;
       if (!picker) {
-        download(doc.name, content);
+        download(doc.name, content, "text/x-python");
         useScripts.getState().markSaved(id, content);
         return "downloaded";
       }
       handle = await picker.call(window, { suggestedName: doc.name, types: PYTHON });
       handles.set(id, handle);
     }
-    await writeTo(handle, content);
+    await writeFile(handle, content);
     useScripts.getState().markSaved(id, content, handle.name);
     return "saved";
   } catch (e) {

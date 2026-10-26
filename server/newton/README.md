@@ -43,6 +43,12 @@ npm run newton -- --device cpu --port 8800
   파티클들에 같은 방식의 힘을 `particle_f`로 더합니다(파티클을 직접 옮기면 VBD의 접촉 기록과 어긋나 불안정해집니다).
 - Newton 1.7 임포터 보완: `physics:body0/1`이 RigidBodyAPI 없는 정적 프림을 가리키는 조인트는 그 프레임을 월드 좌표로 옮기고(세션 레이어에서, 원본 파일은 수정하지 않음), 연결된 바디와 그 정적 형상 사이 충돌을 끕니다. 아티큘레이션에 속하지 않은 조인트도 XPBD에서는 제약으로 풀 수 있으므로 해당 검증만 건너뜁니다.
 
+## 스테이지 저장
+
+뷰어의 저장 대화상자에서 "OpenUSD 서버"를 고르면 이 서버가 저장을 맡습니다. 업로드된 루트 레이어를 `Sdf.Layer`로 열어
+변경 사항(`edits`: 프림 경로별 `matrix`(행 우선 4×4) · `resetXformStack` · `visibility` · `points`)을 기록하고, 원본 옆에
+`Export`해 결과 파일을 돌려줍니다. 브라우저 구현(`src/lib/usd/sdf/edits.ts`)과 같은 방식으로 기록합니다.
+
 ## 프로토콜
 
 WebSocket, JSON 텍스트 메시지 + 바이너리 프레임.
@@ -50,6 +56,7 @@ WebSocket, JSON 텍스트 메시지 + 바이너리 프레임.
 | 방향 | 메시지 |
 |---|---|
 | 클라이언트 → 서버 | `{"type":"load","root","files":[{"path","size"}],"solver":"xpbd","substeps":8,"fps":60}` 다음에 `files` 순서대로 파일당 바이너리 메시지 1개 |
+| | `{"type":"save","root","files":[…],"format":"usda"\|"usdc"\|"usd","edits":[…]}` 다음에 파일 바이너리 — 뷰어의 변경 사항을 루트 레이어에 기록해 OpenUSD로 내보낸 파일을 바이너리 메시지 하나로 돌려줌 |
 | | `{"type":"play"}`, `{"type":"pause"}`, `{"type":"step"}`, `{"type":"reset"}`, `{"type":"speed","value":1}` |
 | | `{"type":"drag","body":<index>,"local":[x,y,z],"target":[x,y,z]}` (local은 바디 좌표계, target은 스테이지 좌표계), `{"type":"drag_particle","particle":<index>,"target":[x,y,z]}`, `{"type":"drag_end"}` |
 | 서버 → 클라이언트 | `{"type":"ready","bodies":[프림 경로…],"cloths":[{"path","start","count"}…],"particles","device","solver","dt","substeps","upAxis","metersPerUnit","joints","shapes","warnings"}` |

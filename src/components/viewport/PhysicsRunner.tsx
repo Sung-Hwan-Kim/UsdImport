@@ -8,7 +8,10 @@ import type { EngineKind, EngineLoadResult, PhysicsEngine } from "@/lib/physics/
 import { NewtonEngine } from "@/lib/physics/newton/newtonEngine";
 import { PhysXEngine } from "@/lib/physics/physx/physxEngine";
 import { authoredAttribute, extractPhysics } from "@/lib/physics/schema";
-import { isShownInHierarchy } from "@/lib/scene";
+import { isShownInHierarchy, stagePathOf } from "@/lib/scene";
+import { getPrimTag } from "@/lib/usd/composer";
+import type { PrimEdit } from "@/lib/usd/sdf/edits";
+import { setSimulationEditsProvider } from "@/lib/usd/stageEdits";
 import { useViewer, type PhysicsCommand } from "@/lib/store";
 import type { LoadedStage } from "@/lib/usd/loadStage";
 
@@ -116,9 +119,27 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
     stage.scene.updateMatrixWorld(true);
   };
 
+  const collectEdits = (s: Session): PrimEdit[] => {
+    const edits: PrimEdit[] = [];
+    stage.scene.updateMatrixWorld(true);
+    const stageInverse = new Matrix4().copy(stage.scene.matrixWorld).invert();
+    s.result.bodies.forEach((obj, i) => {
+      const snap = s.snapshot[i];
+      if (s.result.kinematic[i] || !getPrimTag(obj)) return;
+      if (obj.position.equals(snap.position) && obj.quaternion.equals(snap.quaternion) && obj.scale.equals(snap.scale)) return;
+      // A prim that resets the xform stack is authored relative to the stage, not its parent.
+      const reset = obj.userData.resetXformStack === true;
+      const matrix = reset ? new Matrix4().multiplyMatrices(stageInverse, obj.matrixWorld) : obj.matrix;
+      edits.push({ path: stagePathOf(obj), matrix: Array.from(matrix.elements), resetXformStack: reset || undefined });
+    });
+    if (s.engine.time() > 0) for (const cloth of s.cloths) edits.push({ path: stagePathOf(cloth.mesh), points: cloth.points.slice() });
+    return edits;
+  };
+
   const teardown = () => {
     const s = session.current;
     session.current = null;
+    setSimulationEditsProvider(null);
     if (!s) return;
     s.engine.dispose();
     restore(s);
@@ -172,6 +193,8 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
         });
         engine.setSpeed(useViewer.getState().physics.speed);
         session.current = s;
+        // Saving reads the simulated poses and cloth shapes as they are right now.
+        setSimulationEditsProvider(() => (session.current ? collectEdits(session.current) : []));
         if (result.warnings.length) console.warn("[physics]", result.warnings);
         setPhysics({ status: "paused", label: result.label, warnings: result.warnings, description, time: 0 });
         return s;

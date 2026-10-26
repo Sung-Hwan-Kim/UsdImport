@@ -95,6 +95,7 @@ interface ViewerState {
   physics: PhysicsState;
   panels: { hierarchy: boolean; inspector: boolean };
   canvas: HTMLCanvasElement | null;
+  saveDialog: boolean;
 
   openSource(source: AssetSource, rootPath: string, candidates?: string[]): Promise<void>;
   openFiles(files: LocalFile[]): Promise<void>;
@@ -114,6 +115,7 @@ interface ViewerState {
   togglePanel(panel: "hierarchy" | "inspector"): void;
   setCanvas(canvas: HTMLCanvasElement | null): void;
   clearError(): void;
+  setSaveDialog(open: boolean): void;
 }
 
 const DEFAULT_SETTINGS: ViewSettings = {
@@ -167,6 +169,7 @@ export const useViewer = create<ViewerState>()(
       animation: { playing: false, time: 0, duration: 0, speed: 1, loop: true },
       physics: INITIAL_PHYSICS,
       panels: { hierarchy: true, inspector: true },
+      saveDialog: false,
       canvas: null,
 
       async openSource(source, rootPath, candidates = [rootPath]) {
@@ -281,6 +284,10 @@ export const useViewer = create<ViewerState>()(
 
       clearError() {
         set({ error: null });
+      },
+
+      setSaveDialog(open) {
+        set({ saveDialog: open && !!get().stage });
       },
     }),
     {

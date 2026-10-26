@@ -239,6 +239,8 @@ export async function loadStage(source: AssetSource, requestedRoot: string, opti
   scene.animations = [...scene.animations, ...ctx.animations];
   scene.userData.usd = { layer: rootPath, path: "/", instance: 0, typeName: "Stage" } satisfies PrimTag;
   applyResetXformStacks(scene);
+  // Authored visibility, so saving can tell which prims the viewer showed or hid.
+  scene.traverse((obj) => (obj.userData.loadedVisible = obj.visible));
   const composeTime = performance.now() - tCompose;
 
   const tTextures = performance.now();

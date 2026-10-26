@@ -144,7 +144,8 @@ export function setFromXform(obj: Object3D, { matrix, scale }: EvaluatedXform): 
 /**
  * Prims flagged with `userData.resetXformStack` keep their local transform as
  * their transform in the stage, ignoring their ancestors' (the stage root's
- * unit and up-axis conversion still applies).
+ * unit and up-axis conversion still applies). The flag stays, so saving can
+ * author such a prim's transform relative to the stage again.
  */
 export function applyResetXformStacks(root: Object3D): void {
   const flagged: Object3D[] = [];
@@ -158,7 +159,6 @@ export function applyResetXformStacks(root: Object3D): void {
   const parentInStage = new Matrix4();
   // traverse() is pre-order, so flagged ancestors are re-parented first.
   for (const obj of flagged) {
-    delete obj.userData.resetXformStack;
     if (!obj.parent) continue;
     parentInStage.multiplyMatrices(rootInverse, obj.parent.matrixWorld).invert();
     local.compose(obj.position, obj.quaternion, obj.scale).premultiply(parentInStage);

@@ -1,6 +1,6 @@
 "use client";
 
-import { Camera, CircleHelp, FileUp, FolderOpen, Layers, PanelLeft, PanelRight, SquareCode } from "lucide-react";
+import { Camera, CircleHelp, FileUp, FolderOpen, Layers, PanelLeft, PanelRight, Save, SquareCode } from "lucide-react";
 import { pickLocalFiles } from "@/lib/files";
 import { formatCount } from "@/lib/format";
 import { SAMPLES, sampleUrl } from "@/lib/samples";
@@ -69,6 +69,7 @@ const SHORTCUTS: [string, string][] = [
   ["Space", "애니메이션 재생/정지"],
   ["P / Shift+R", "물리 재생·일시정지 / 리셋"],
   ["E", "Isaac Sim 스크립트 에디터"],
+  ["Ctrl+S", "스테이지 저장 (USDA · USDC · USD)"],
   ["↑ ↓ ← →", "계층 트리 탐색"],
 ];
 
@@ -107,6 +108,7 @@ export default function TopBar() {
   const openFiles = useViewer((s) => s.openFiles);
   const scriptsOpen = useScripts((s) => s.open);
   const setScriptsOpen = useScripts((s) => s.setOpen);
+  const setSaveDialog = useViewer((s) => s.setSaveDialog);
 
   return (
     <header className="flex h-12 shrink-0 items-center gap-1.5 border-b border-line bg-panel px-2">
@@ -134,6 +136,7 @@ export default function TopBar() {
         <Button icon={FileUp} variant="primary" onClick={() => pickLocalFiles(false).then(openFiles)}>
           <span className="hidden sm:inline">파일 열기</span>
         </Button>
+        <IconButton icon={Save} label="스테이지 저장" shortcut="Ctrl+S" onClick={() => setSaveDialog(true)} disabled={!stage} />
         <div className="mx-1 h-5 w-px bg-line" />
         <IconButton icon={SquareCode} label="Isaac Sim 스크립트 에디터" shortcut="E" active={scriptsOpen} onClick={() => setScriptsOpen(!scriptsOpen)} />
         <IconButton icon={Camera} label="스크린샷 저장 (PNG)" onClick={saveScreenshot} disabled={!stage} />

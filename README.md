@@ -28,6 +28,7 @@ npm run build && npm start
 | `Space` | 애니메이션 재생/정지 |
 | `P` / `Shift+R` | 물리 재생·일시정지 / 리셋 |
 | `E` | Isaac Sim 스크립트 에디터 열기/닫기 |
+| `Ctrl+S` | 스테이지 저장 (USDA · USDC · USD) |
 | `↑↓←→` | 계층 트리 탐색 |
 
 ## 물리 시뮬레이션
@@ -52,6 +53,18 @@ npm run build && npm start
 
 엔진은 물리 바 왼쪽의 메뉴에서 바꿉니다. 물리 샘플: **Physics Playground**(USDA), **Physics Joints**(USDC), **Dominoes (Z-up, cm)**(USD),
 **Physics Cloth**(USDA, Newton — 식탁보 · 봉에 고정된 커튼 · 공).
+
+## 저장
+
+상단 바의 저장 버튼이나 `Ctrl+S`로 열려 있는 스테이지의 **루트 레이어**를 USDA(텍스트) · USDC(바이너리) · USD(바이너리)로 저장합니다.
+
+- **반영되는 변경 사항**: 물리 재생 결과 포즈(리지드 바디, `xformOp:transform` 하나로 기록), 천 모양(`points`), 뷰어에서 숨기거나 다시 표시한 프림(`visibility`).
+  참조나 서브레이어에서 온 프림은 루트 레이어에 `over`로 기록합니다
+- **구조 유지**: 참조 · 서브레이어 · 배리언트 · 메타데이터 등 원본 내용은 그대로 두고, 참조 경로도 원본 기준 상대 경로 그대로 저장합니다(원본과 같은 폴더에 저장하세요)
+- **변환 방식**: 기본은 브라우저에서 직접 변환합니다. 뷰어 표시용 파서와 별도로, USDA/USDC를 손실 없이 읽고 쓰는 구현(`src/lib/usd/sdf/`)을 씁니다.
+  로컬 Newton 서버(`npm run newton`)가 켜져 있으면 OpenUSD로 저장하는 쪽을 기본으로 고릅니다
+- 두 방식의 결과는 같으며, 테스트 코퍼스(모든 값 형식 · 리스트 연산 · 참조 · 배리언트 · 타임샘플)와 샘플 전체를 OpenUSD로 다시 읽어 원본과 같음을 확인했습니다
+- 제한: USDZ 패키지는 저장하지 않습니다. 브라우저 변환은 스플라인 · 배열 편집(ArrayEdit) 같은 최신 값 형식을 만나면 저장을 멈추고 알려 줍니다(OpenUSD 서버로는 저장 가능)
 
 ## Isaac Sim 스크립트 에디터
 
@@ -95,6 +108,7 @@ src/lib/physics/
   engine.ts       엔진 공통 인터페이스
   physx/          PhysX WASM 백엔드 (타입 래퍼 px.ts, physxEngine.ts)
   newton/         Newton 서버 클라이언트 (WebSocket)
+src/lib/usd/sdf/  저장용 무손실 USD 레이어 모델: USDA 읽기/쓰기, USDC(Crate) 읽기/쓰기, 압축, 편집 적용
 src/lib/scripts/  스크립트 에디터: CodeMirror 설정, Isaac Sim API 자동완성 카탈로그, 템플릿, 파일 열기/저장
 src/components/   뷰어 UI(계층, 인스펙터, 툴바, 애니메이션 바, 물리 바, 스크립트 에디터)와 R3F 뷰포트(PhysicsRunner, ColliderOverlay)
 server/newton/    Newton 물리 서버 (Python, WebSocket)
@@ -113,7 +127,8 @@ scripts/generate_samples.py   public/samples 생성 스크립트 (`pip install u
 
 ## 알려진 제한 사항
 
-- USDA의 `variantSet` 블록, `inherits` / `specializes`, 내부 참조(에셋 없는 `</Path>`)는 지원하지 않습니다
+- 표시: USDA의 `variantSet` 블록, `inherits` / `specializes`, 내부 참조(에셋 없는 `</Path>`)는 지원하지 않습니다
+  (저장은 이것들을 모두 그대로 유지합니다)
 - DomeLight(HDR 환경 조명), PointInstancer, BasisCurves / Points, UDIM, EXR/TIFF 텍스처는 지원하지 않습니다
 - 큰 파일은 메인 스레드에서 파싱하므로 로딩 중 UI가 잠깐 멈출 수 있습니다
 - 물리: 아티큘레이션(ArticulationRootAPI)은 일반 조인트로 시뮬레이션합니다. convexDecomposition은 PhysX에서 단일 볼록 껍질로 근사하며,

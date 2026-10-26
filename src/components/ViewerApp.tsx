@@ -12,6 +12,7 @@ import HierarchyPanel from "./HierarchyPanel";
 import InspectorPanel from "./InspectorPanel";
 import { DropOverlay, EmptyState, ErrorToast, LoadingOverlay, RenderStatsOverlay } from "./Overlays";
 import PhysicsBar from "./PhysicsBar";
+import SaveDialog from "./SaveDialog";
 import ScriptEditor from "./ScriptEditor";
 import TopBar from "./TopBar";
 import { cn } from "./ui";
@@ -71,8 +72,13 @@ function useFileDrop(): boolean {
 function useShortcuts() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement | null;
+      const target = e.target instanceof Element ? e.target : null;
       if (target?.closest("input, textarea, select, [contenteditable='true']")) return;
+      if ((e.ctrlKey || e.metaKey) && e.code === "KeyS") {
+        e.preventDefault();
+        useViewer.getState().setSaveDialog(true);
+        return;
+      }
       if (e.ctrlKey || e.metaKey) return;
       const s = useViewer.getState();
       const toggle = (key: "grid" | "sceneLights" | "autoRotate") => s.setSetting(key, !s.settings[key]);
@@ -191,6 +197,7 @@ export default function ViewerApp() {
         )}
       </div>
       {dragging && <DropOverlay />}
+      <SaveDialog />
     </div>
   );
 }

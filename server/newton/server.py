@@ -24,7 +24,7 @@ from pathlib import Path, PurePosixPath
 
 import numpy as np
 import warp as wp
-from pxr import Gf, Usd, UsdGeom, UsdPhysics
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, Vt
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
@@ -447,6 +447,45 @@ class Simulation:
         }
 
 
+def _set_attribute(prim: Sdf.PrimSpec, name: str, type_name, value, uniform: bool = False) -> None:
+    attr = prim.attributes.get(name)
+    if attr is None:
+        variability = Sdf.VariabilityUniform if uniform else Sdf.VariabilityVarying
+        attr = Sdf.AttributeSpec(prim, name, type_name, variability)
+    attr.default = value
+    # Samples in the same layer would win over the new default.
+    if attr.HasInfo("timeSamples"):
+        attr.ClearInfo("timeSamples")
+
+
+def export_layer(root: Path, edits: list[dict], fmt: str) -> bytes:
+    """Author the viewer's edits into the root layer and export it with OpenUSD.
+
+    Mirrors the browser's src/lib/usd/sdf/edits.ts: `over` specs where the
+    layer has none, a single matrix op for transforms, visibility tokens, and
+    mesh points. References and sublayers are left as authored.
+    """
+    layer = Sdf.Layer.FindOrOpen(str(root))
+    if layer is None:
+        raise RuntimeError(f"레이어를 열 수 없습니다: {root.name}")
+    for edit in edits:
+        prim = Sdf.CreatePrimInLayer(layer, edit["path"])
+        if edit.get("matrix"):
+            _set_attribute(prim, "xformOp:transform", Sdf.ValueTypeNames.Matrix4d, Gf.Matrix4d(*edit["matrix"]))
+            order = ["!resetXformStack!", "xformOp:transform"] if edit.get("resetXformStack") else ["xformOp:transform"]
+            _set_attribute(prim, "xformOpOrder", Sdf.ValueTypeNames.TokenArray, Vt.TokenArray(order), uniform=True)
+        if edit.get("visibility"):
+            _set_attribute(prim, "visibility", Sdf.ValueTypeNames.Token, edit["visibility"])
+        if edit.get("points"):
+            points = np.asarray(edit["points"], dtype=np.float32).reshape(-1, 3)
+            _set_attribute(prim, "points", Sdf.ValueTypeNames.Point3fArray, Vt.Vec3fArray.FromNumpy(points))
+    # Export next to the original so relative asset paths keep pointing at the same files.
+    out = root.with_name(f"{root.stem}.saved.{fmt}")
+    if not layer.Export(str(out), args={"format": "usda" if fmt == "usda" else "usdc"}):
+        raise RuntimeError("레이어를 내보내지 못했습니다.")
+    return out.read_bytes()
+
+
 def safe_relative_path(raw: str) -> PurePosixPath:
     """Reject absolute paths and `..` so uploads stay inside the session's temp folder."""
     path = PurePosixPath(raw.replace("\\", "/"))
@@ -506,7 +545,7 @@ class Connection:
             return
         msg = json.loads(message)
         kind = msg.get("type")
-        if kind == "load":
+        if kind in ("load", "save"):
             await self.begin_upload(msg)
         elif kind == "play":
             await self.set_playing(self.sim is not None)
@@ -546,6 +585,8 @@ class Connection:
             "solver": msg.get("solver", "xpbd"),
             "substeps": int(msg.get("substeps", 8)),
             "fps": float(msg.get("fps", 60)),
+            # "save": author edits into the root layer and send it back instead of simulating.
+            "save": {"edits": msg.get("edits", []), "format": msg.get("format", "usda")} if msg.get("type") == "save" else None,
         }
 
     async def receive_file(self, data: bytes) -> None:
@@ -563,6 +604,13 @@ class Connection:
             return
         self.upload = None
         root = self.workdir / Path(*upload["root"].parts)
+        save = upload["save"]
+        if save is not None:
+            if save["format"] not in ("usda", "usdc", "usd"):
+                raise ValueError(f"지원하지 않는 형식입니다: {save['format']}")
+            print(f"[newton] saving {upload['root']} as {save['format']} with {len(save['edits'])} edits")
+            await self.ws.send(await self.run_sim(export_layer, root, save["edits"], save["format"]))
+            return
         print(f"[newton] loading {upload['root']} ({len(upload['files'])} files) on {self.device} with {upload['solver']}")
         self.sim = await self.run_sim(Simulation, root, self.device, upload["solver"], upload["substeps"], upload["fps"])
         print(
