@@ -16,8 +16,10 @@ export const viewport: Viewport = {
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="ko">
-      <body className={`${geistSans.variable} ${geistMono.variable} font-sans antialiased`}>{children}</body>
+    // The font variables live on <html>: the theme's --font-sans/--font-mono are
+    // resolved at :root and would be empty if these were only set on <body>.
+    <html lang="ko" className={`${geistSans.variable} ${geistMono.variable}`}>
+      <body className="font-sans antialiased">{children}</body>
     </html>
   );
 }
