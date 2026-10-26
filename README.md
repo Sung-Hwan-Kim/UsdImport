@@ -48,7 +48,13 @@ npm run build && npm start
 - 인스펙터의 "물리" 섹션: 바디 종류·질량·초기 속도, 콜라이더 형상·물리 머티리얼, 조인트 종류·대상·제한·드라이브, 중력
 - 지원 범위: 리지드 바디(dynamic/kinematic), 콜라이더(Cube/Sphere/Capsule 기본 형상, 볼록 껍질, 정적 삼각형 메시),
   물리 머티리얼(마찰·반발·밀도), MassAPI, 초기 선·각속도, 조인트(revolute · prismatic · spherical · fixed · distance · 일반 D6)와
-  LimitAPI · DriveAPI, PhysicsScene 중력, `upAxis` · `metersPerUnit` 변환
+  LimitAPI · DriveAPI, 조인트 파단 힘(`physics:breakForce` · `breakTorque`), 충돌 그룹(`PhysicsCollisionGroup`) · `FilteredPairsAPI`,
+  PhysicsScene 중력, `upAxis` · `metersPerUnit` 변환
+- **PhysX 설정 (Isaac Sim과 같은 거동)**: PhysX 엔진은 Isaac Sim이 쓰는 PhysxSchema 속성도 읽습니다 —
+  `physxScene:`(솔버 TGS/PGS, 스텝 수, 안정화, CCD, 최소·최대 반복 횟수), `physxRigidBody:`(반복 횟수, 감쇠, 최대 속도·탈출 속도,
+  슬립·안정화 문턱, CCD), `physxCollision:contactOffset` · `restOffset`, `physxMaterial:` 마찰·반발 결합 방식, `physxLimit:` 소프트 한계.
+  작성되지 않은 값은 PhysxSchema 기본값(TGS 솔버, 위치 반복 16 · 속도 반복 1)을 씁니다. 칼이 테이프를 밀어 파단 힘으로 끊는
+  종이 상자 장면도 Isaac Sim과 같은 시점에 끊깁니다
 - **천 (Newton 전용)**: AOUSD Deformable 제안 스키마 — `PhysicsSurfaceDeformableSimAPI`를 적용한 Mesh(점 하나가 파티클 하나),
   `PhysicsSurfaceDeformableMaterialAPI`(밀도 · 영률 · 푸아송 비), `physics:thicknesses`, 정적 대상에 붙인 `PhysicsAttachment`(고정점).
   리지드 바디와 서로 충돌하며, PhysX를 고르면 천은 움직이지 않는 채로 남습니다
@@ -148,6 +154,6 @@ scripts/generate_samples.py   public/samples 생성 스크립트 (`pip install u
 - DomeLight(HDR 환경 조명), PointInstancer, BasisCurves / Points, UDIM, EXR/TIFF 텍스처는 지원하지 않습니다
 - 큰 파일은 메인 스레드에서 파싱하므로 로딩 중 UI가 잠깐 멈출 수 있습니다
 - 물리: 아티큘레이션(ArticulationRootAPI)은 일반 조인트로 시뮬레이션합니다. convexDecomposition은 PhysX에서 단일 볼록 껍질로 근사하며,
-  동적 바디의 삼각형 메시 콜라이더도 볼록 껍질로 대체합니다. 충돌 그룹 · FilteredPairsAPI는 아직 반영하지 않습니다
+  동적 바디의 삼각형 메시 콜라이더도 볼록 껍질로 대체합니다. 조인트 파단 힘은 PhysX에서만 동작합니다(Newton에는 파단 기능이 없음)
 - Deformable: 천만 지원합니다(Newton). 볼륨(TetMesh) · 커브 Deformable, 리지드 바디에 붙인 천 Attachment, 예전 Omniverse의
   `PhysxDeformableBodyAPI` · `PhysxParticleClothAPI`는 지원하지 않습니다

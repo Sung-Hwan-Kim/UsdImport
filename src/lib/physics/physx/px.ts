@@ -14,6 +14,11 @@ interface PxHeap {
   _webidl_free(ptr: number): void;
 }
 
+interface PxPointers {
+  getPointer(obj: object): number;
+  wrapPointer(ptr: number, type: unknown): object;
+}
+
 interface RigidBodyExt {
   updateMassAndInertia(body: PhysX.PxRigidBody, density: number, massLocalPose?: PhysX.PxVec3): boolean;
   setMassAndUpdateInertia(body: PhysX.PxRigidBody, mass: number, massLocalPose?: PhysX.PxVec3): boolean;
@@ -76,6 +81,29 @@ export function freeHeap(px: Px, ptr: number): void {
 /** Joint creation accepts a null actor (world attachment) at runtime. */
 export function actorOrWorld(actor: PhysX.PxRigidActor | null): PhysX.PxRigidActor {
   return actor as PhysX.PxRigidActor;
+}
+
+/**
+ * Install a JS simulation filter on a scene description. `collide` gets each new
+ * broad-phase pair's filter data word3 and returns false to drop the pair; kept
+ * pairs get eCONTACT_DEFAULT plus both shapes' word2 pair flags, as the binding's
+ * DefaultFilterShader does. The returned implementation must outlive the scene;
+ * destroy it afterwards.
+ */
+export function setFilterShader(px: Px, sceneDesc: PhysX.PxSceneDesc, collide: (word3a: number, word3b: number) => boolean): PhysX.PassThroughFilterShaderImpl {
+  const shader = new px.PassThroughFilterShaderImpl();
+  // The pair flags live on the C++ base class, which the Impl wrapper does not expose.
+  const pointers = px as unknown as PxPointers;
+  const base = pointers.wrapPointer(pointers.getPointer(shader), px.PassThroughFilterShader) as PhysX.PassThroughFilterShader;
+  const kill = px.PxFilterFlagEnum.eKILL;
+  const contact = px.PxPairFlagEnum.eCONTACT_DEFAULT;
+  shader.filterShader = (_a0, _w00, _w01, w02, w03, _a1, _w10, _w11, w12, w13) => {
+    if (!collide(w03, w13)) return kill;
+    base.outputPairFlags = contact | w02 | w12;
+    return 0; // eDEFAULT
+  };
+  px.setupPassThroughFilterShader(sceneDesc, shader as unknown as PhysX.PassThroughFilterShader);
+  return shader;
 }
 
 export function setBoundedData(bounded: PhysX.PxBoundedData, count: number, stride: number, ptr: number): void {

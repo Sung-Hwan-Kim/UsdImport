@@ -25,7 +25,12 @@ export interface PhysicsMaterialInfo {
   restitution: number;
   /** kg/m³ */
   density?: number;
+  /** physxMaterial:frictionCombineMode / restitutionCombineMode, when authored. */
+  frictionCombine?: CombineMode;
+  restitutionCombine?: CombineMode;
 }
+
+export type CombineMode = "average" | "min" | "multiply" | "max";
 
 export interface ColliderInfo {
   object: Object3D;
@@ -47,6 +52,19 @@ export interface ColliderInfo {
   points?: Float32Array;
   indices?: Uint32Array;
   material: PhysicsMaterialInfo;
+  /** Indices into `PhysicsDescription.collisionGroups`. */
+  groups: number[];
+  /** physxCollision:contactOffset / restOffset (m), when authored. */
+  contactOffset?: number;
+  restOffset?: number;
+}
+
+/** A PhysicsCollisionGroup (groups sharing a mergeGroupName are one). */
+export interface CollisionGroupInfo {
+  path: string;
+  /** Groups this one does not collide with; with `invert`, the only groups it collides with. */
+  filtered: number[];
+  invert: boolean;
 }
 
 export interface BodyInfo {
@@ -66,6 +84,32 @@ export interface BodyInfo {
   linearVelocity: Vector3;
   angularVelocity: Vector3;
   colliders: ColliderInfo[];
+  /** PhysxRigidBodyAPI settings that are authored (SI units, rad). */
+  physx: PhysxBodySettings;
+}
+
+export interface PhysxBodySettings {
+  positionIterations?: number;
+  velocityIterations?: number;
+  linearDamping?: number;
+  angularDamping?: number;
+  maxLinearVelocity?: number;
+  maxAngularVelocity?: number;
+  maxDepenetrationVelocity?: number;
+  sleepThreshold?: number;
+  stabilizationThreshold?: number;
+  ccd?: boolean;
+  speculativeCcd?: boolean;
+}
+
+/** PhysxSceneAPI settings, with PhysxSchema's defaults. */
+export interface PhysxSceneSettings {
+  solver: "TGS" | "PGS";
+  stabilization: boolean;
+  ccd: boolean;
+  /** Bounds for every body's solver iteration counts. */
+  positionIterations: [number, number];
+  velocityIterations: [number, number];
 }
 
 /** A time-sampled scalar, times in seconds from the stage's start time code. */
@@ -121,6 +165,8 @@ export interface JointInfo {
   collisionEnabled: boolean;
   breakForce: number;
   breakTorque: number;
+  /** Soft limits (physxLimit:<axis>:stiffness/damping), per radian or metre. */
+  limitSprings: Partial<Record<"angular" | "linear" | Dof, { stiffness: number; damping: number }>>;
 }
 
 export type DeformableKind = "surface" | "volume" | "curves";
@@ -144,6 +190,10 @@ export interface PhysicsDescription {
   staticColliders: ColliderInfo[];
   joints: JointInfo[];
   deformables: DeformableInfo[];
+  collisionGroups: CollisionGroupInfo[];
+  physxScene: PhysxSceneSettings;
+  /** FilteredPairsAPI: no collider of one side collides with any of the other. */
+  filteredPairs: [ColliderInfo[], ColliderInfo[]][];
   warnings: string[];
   /** Lookup for the inspector. */
   byObject: Map<Object3D, { body?: BodyInfo; collider?: ColliderInfo; joint?: JointInfo; deformable?: DeformableInfo }>;
@@ -351,6 +401,12 @@ function meshTriangles(mesh: Mesh, scale: Vector3): { points: Float32Array; indi
 
 // ---------------------------------------------------------------- extraction
 
+const COMBINE_MODES: CombineMode[] = ["average", "min", "multiply", "max"];
+
+function combineMode(v: unknown): CombineMode | undefined {
+  return COMBINE_MODES.find((m) => m === v);
+}
+
 export function extractPhysics(stage: LoadedStage): PhysicsDescription {
   const reader = new SpecReader(stage);
   const warnings: string[] = [];
@@ -385,6 +441,12 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
     byStagePath.set(stagePathOf(obj), obj);
   });
   const resolveTarget = (tag: PrimTag, path: string) => byInstance.get(`${tag.instance}|${path}`) ?? byStagePath.get(path) ?? null;
+  /** An authored finite number, scaled; undefined when unauthored (PhysX keeps its default). */
+  const authoredNumber = (obj: Object3D, name: string, scale = 1) => {
+    const v = reader.num(obj, name, Number.NaN);
+    return Number.isFinite(v) ? v * scale : undefined;
+  };
+  const authoredBool = (obj: Object3D, name: string) => (reader.attr(obj, name) === undefined ? undefined : reader.bool(obj, name, false));
 
   // ---- rigid bodies
   const bodies: BodyInfo[] = [];
@@ -415,6 +477,20 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
       linearVelocity: v.applyMatrix3(new Matrix3().setFromMatrix4(parentMatrix)),
       angularVelocity: w.applyQuaternion(parentRotation).multiplyScalar(MathUtils.DEG2RAD),
       colliders: [],
+      physx: {
+        positionIterations: authoredNumber(obj, "physxRigidBody:solverPositionIterationCount"),
+        velocityIterations: authoredNumber(obj, "physxRigidBody:solverVelocityIterationCount"),
+        linearDamping: authoredNumber(obj, "physxRigidBody:linearDamping"),
+        angularDamping: authoredNumber(obj, "physxRigidBody:angularDamping"),
+        maxLinearVelocity: authoredNumber(obj, "physxRigidBody:maxLinearVelocity", unitScale),
+        maxAngularVelocity: authoredNumber(obj, "physxRigidBody:maxAngularVelocity", MathUtils.DEG2RAD),
+        maxDepenetrationVelocity: authoredNumber(obj, "physxRigidBody:maxDepenetrationVelocity", unitScale),
+        // Mass-normalized kinetic energies.
+        sleepThreshold: authoredNumber(obj, "physxRigidBody:sleepThreshold", unitScale ** 2),
+        stabilizationThreshold: authoredNumber(obj, "physxRigidBody:stabilizationThreshold", unitScale ** 2),
+        ccd: authoredBool(obj, "physxRigidBody:enableCCD"),
+        speculativeCcd: authoredBool(obj, "physxRigidBody:enableSpeculativeCCD"),
+      },
     };
     if (reader.hasApi(obj, "PhysicsMassAPI")) {
       const mass = reader.num(obj, "physics:mass", 0);
@@ -455,6 +531,8 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
         dynamicFriction: num("physics:dynamicFriction", 0),
         restitution: num("physics:restitution", 0),
         density: density > 0 ? density / unitScale ** 3 : undefined,
+        frictionCombine: combineMode(reader.attrAt(binding.tag, path, "physxMaterial:frictionCombineMode")),
+        restitutionCombine: combineMode(reader.attrAt(binding.tag, path, "physxMaterial:restitutionCombineMode")),
       };
     }
     return DEFAULT_MATERIAL;
@@ -525,7 +603,13 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
       approximation: authored,
       localPose: body ? relativePose(body.pose, pose) : { position: pose.position, quaternion: pose.quaternion },
       material: materialFor(obj),
+      groups: [],
     };
+    // Unauthored offsets are -inf in PhysxSchema: PhysX picks them.
+    const contactOffset = authoredNumber(obj, "physxCollision:contactOffset", unitScale);
+    const restOffset = authoredNumber(obj, "physxCollision:restOffset", unitScale);
+    if (contactOffset !== undefined && contactOffset >= 0) collider.contactOffset = contactOffset;
+    if (restOffset !== undefined) collider.restOffset = restOffset;
     const s = pose.scale;
     const uniform = Math.abs(s.x - s.y) < 1e-6 * s.x && Math.abs(s.x - s.z) < 1e-6 * s.x;
     const geometry = mesh.geometry;
@@ -565,6 +649,77 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
     if (body) body.colliders.push(collider);
     else staticColliders.push(collider);
     entry(obj).collider = collider;
+  });
+
+  // ---- collision filtering: CollisionGroups (by collection membership) and FilteredPairsAPI
+  const colliders = [...staticColliders, ...bodies.flatMap((b) => b.colliders)];
+  const collisionGroups: CollisionGroupInfo[] = [];
+  const groupIndex = new Map<Object3D, number>();
+  const mergeIndex = new Map<string, number>();
+  const groupObjects: Object3D[] = [];
+  root.traverse((obj) => {
+    if (getPrimTag(obj)?.typeName === "PhysicsCollisionGroup") groupObjects.push(obj);
+  });
+  for (const obj of groupObjects) {
+    const merge = reader.token(obj, "physics:mergeGroupName");
+    let index = merge ? mergeIndex.get(merge) : undefined;
+    if (index === undefined) {
+      index = collisionGroups.length;
+      collisionGroups.push({ path: stagePathOf(obj), filtered: [], invert: false });
+      if (merge) mergeIndex.set(merge, index);
+    }
+    groupIndex.set(obj, index);
+  }
+  for (const obj of groupObjects) {
+    const group = collisionGroups[groupIndex.get(obj)!];
+    group.invert ||= reader.bool(obj, "physics:invertFilteredGroups", false);
+    const filtered = reader.rel(obj, "physics:filteredGroups");
+    for (const path of filtered?.targets ?? []) {
+      const index = groupIndex.get(resolveTarget(filtered!.tag, path) ?? root);
+      if (index !== undefined && !group.filtered.includes(index)) group.filtered.push(index);
+    }
+    // collection:colliders — the nearest included or excluded ancestor decides (expandPrims).
+    const rule = new Map<Object3D, boolean>();
+    for (const [name, included] of [["includes", true], ["excludes", false]] as const) {
+      const rel = reader.rel(obj, `collection:colliders:${name}`);
+      for (const path of rel?.targets ?? []) {
+        const target = resolveTarget(rel!.tag, path);
+        if (target) rule.set(target, included);
+      }
+    }
+    const includeRoot = reader.bool(obj, "collection:colliders:includeRoot", false);
+    const explicitOnly = reader.token(obj, "collection:colliders:expansionRule") === "explicitOnly";
+    for (const c of colliders) {
+      let member = includeRoot && !explicitOnly;
+      for (let cur: Object3D | null = c.object; cur && cur !== root; cur = explicitOnly ? null : cur.parent) {
+        const r = rule.get(cur);
+        if (r === undefined) continue;
+        member = r;
+        break;
+      }
+      if (member && !c.groups.includes(groupIndex.get(obj)!)) c.groups.push(groupIndex.get(obj)!);
+    }
+  }
+
+  const filteredPairs: [ColliderInfo[], ColliderInfo[]][] = [];
+  const collidersOf = (obj: Object3D): ColliderInfo[] => {
+    const e = byObject.get(obj);
+    if (e?.collider) return [e.collider];
+    if (e?.body) return e.body.colliders;
+    return colliders.filter((c) => {
+      for (let cur: Object3D | null = c.object; cur; cur = cur.parent) if (cur === obj) return true;
+      return false;
+    });
+  };
+  root.traverse((obj) => {
+    if (obj === root || !reader.hasApi(obj, "PhysicsFilteredPairsAPI")) return;
+    const rel = reader.rel(obj, "physics:filteredPairs");
+    const own = rel ? collidersOf(obj) : [];
+    for (const path of rel?.targets ?? []) {
+      const target = resolveTarget(rel!.tag, path);
+      const other = target ? collidersOf(target) : [];
+      if (own.length && other.length) filteredPairs.push([own, other]);
+    }
   });
 
   for (const body of bodies) {
@@ -646,7 +801,15 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
       collisionEnabled: reader.bool(obj, "physics:collisionEnabled", false),
       breakForce: reader.num(obj, "physics:breakForce", Number.POSITIVE_INFINITY) * unitScale,
       breakTorque: reader.num(obj, "physics:breakTorque", Number.POSITIVE_INFINITY) * unitScale ** 2,
+      limitSprings: {},
     };
+    for (const name of type === "revolute" ? ["angular"] : type === "prismatic" ? ["linear"] : type === "generic" ? DOFS : []) {
+      const angular = name === "angular" || name.startsWith("rot");
+      const perRad = angular ? MathUtils.RAD2DEG : 1;
+      const stiffness = authoredNumber(obj, `physxLimit:${name}:stiffness`, perRad) ?? 0;
+      const damping = authoredNumber(obj, `physxLimit:${name}:damping`, perRad) ?? 0;
+      if (stiffness > 0 || damping > 0) joint.limitSprings[name as Dof] = { stiffness, damping };
+    }
     if (type === "revolute") {
       joint.lower = deg("physics:lowerLimit");
       joint.upper = deg("physics:upperLimit");
@@ -707,6 +870,7 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
   // ---- scene
   let gravity = new Vector3(0, -9.81, 0);
   let stepsPerSecond: number | undefined;
+  const physxScene: PhysxSceneSettings = { solver: "TGS", stabilization: false, ccd: false, positionIterations: [1, 255], velocityIterations: [0, 255] };
   root.traverse((obj) => {
     if (getPrimTag(obj)?.typeName !== "PhysicsScene") return;
     const dir = reader.vec3(obj, "physics:gravityDirection");
@@ -717,9 +881,43 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
     gravity = worldDir.multiplyScalar(worldMagnitude);
     const rate = reader.num(obj, "physxScene:timeStepsPerSecond", 0);
     if (rate > 0) stepsPerSecond = rate;
+    if (reader.token(obj, "physxScene:solverType") === "PGS") physxScene.solver = "PGS";
+    physxScene.stabilization = reader.bool(obj, "physxScene:enableStabilization", false);
+    physxScene.ccd = reader.bool(obj, "physxScene:enableCCD", false);
+    physxScene.positionIterations = [reader.num(obj, "physxScene:minPositionIterationCount", 1), reader.num(obj, "physxScene:maxPositionIterationCount", 255)];
+    physxScene.velocityIterations = [reader.num(obj, "physxScene:minVelocityIterationCount", 0), reader.num(obj, "physxScene:maxVelocityIterationCount", 255)];
   });
 
-  return { gravity, stepsPerSecond, bodies, staticColliders, joints, deformables, warnings, byObject };
+  return { gravity, stepsPerSecond, bodies, staticColliders, joints, deformables, collisionGroups, physxScene, filteredPairs, warnings, byObject };
+}
+
+/**
+ * Whether two colliders may touch under the description's collision groups and
+ * filtered pairs, or null when nothing is filtered. Two colliders collide unless
+ * a group of either one filters a group of the other, or a filtered pair holds both.
+ */
+export function collisionFilter(d: PhysicsDescription): ((a: ColliderInfo, b: ColliderInfo) => boolean) | null {
+  const groups = d.collisionGroups;
+  if (!groups.some((g) => g.filtered.length || g.invert) && !d.filteredPairs.length) return null;
+  const pairs = new Map<ColliderInfo, Set<ColliderInfo>>();
+  const add = (a: ColliderInfo, b: ColliderInfo) => {
+    let set = pairs.get(a);
+    if (!set) pairs.set(a, (set = new Set()));
+    set.add(b);
+  };
+  for (const [as, bs] of d.filteredPairs) {
+    for (const a of as) {
+      for (const b of bs) {
+        add(a, b);
+        add(b, a);
+      }
+    }
+  }
+  const blocks = (g: CollisionGroupInfo, others: number[]) => others.some((h) => g.filtered.includes(h)) !== g.invert;
+  return (a, b) => {
+    if (pairs.get(a)?.has(b)) return false;
+    return !a.groups.some((g) => blocks(groups[g], b.groups)) && !b.groups.some((g) => blocks(groups[g], a.groups));
+  };
 }
 
 /** An attribute's authored value on an object's prim (default, else first time sample). */

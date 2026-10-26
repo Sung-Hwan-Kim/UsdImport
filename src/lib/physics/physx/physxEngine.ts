@@ -3,6 +3,7 @@ import type { LoadedStage } from "../../usd/loadStage";
 import type { EngineLoadResult, PhysicsEngine } from "../engine";
 import {
   axisRotation,
+  collisionFilter,
   driveTargetsAt,
   hasAnimatedDrives,
   relativePose,
@@ -24,12 +25,16 @@ import {
   pxVec3,
   rigidBodyExt,
   setBoundedData,
+  setFilterShader,
   type PhysX,
   type PhysXRuntime,
   type Px,
 } from "./px";
 
 const DEFAULT_DENSITY = 1000; // kg/m³
+// PhysxSchema defaults for bodies without authored iteration counts, as in Isaac Sim.
+const DEFAULT_POSITION_ITERATIONS = 16;
+const DEFAULT_VELOCITY_ITERATIONS = 1;
 // Mouse spring, as an acceleration drive so light and heavy bodies follow alike.
 const DRAG_STIFFNESS = 400;
 const DRAG_DAMPING = 40;
@@ -131,6 +136,9 @@ export class PhysXEngine implements PhysicsEngine {
   private actors: PhysX.PxRigidDynamic[] = [];
   private statics: PhysX.PxRigidStatic[] = [];
   private staticByCollider = new Map<ColliderInfo, PhysX.PxRigidStatic>();
+  /** Collider ids carried in each shape's filter data (word3) for the filter shader. */
+  private colliderIds = new Map<ColliderInfo, number>();
+  private filterShader: PhysX.PassThroughFilterShaderImpl | null = null;
   private joints: Releasable[] = [];
   /** D6 joints whose drive targets are time-sampled; re-targeted before every step. */
   private animatedDrives: { joint: PhysX.PxD6Joint; info: JointInfo }[] = [];
@@ -170,7 +178,19 @@ export class PhysXEngine implements PhysicsEngine {
     const gravity = pxVec3(px, d.gravity);
     sceneDesc.gravity = gravity;
     sceneDesc.cpuDispatcher = px.DefaultCpuDispatcherCreate(0);
-    sceneDesc.filterShader = px.DefaultFilterShader();
+    const settings = d.physxScene;
+    sceneDesc.solverType = settings.solver === "TGS" ? px.PxSolverTypeEnum.eTGS : px.PxSolverTypeEnum.ePGS;
+    if (settings.stabilization) sceneDesc.flags.raise(px.PxSceneFlagEnum.eENABLE_STABILIZATION);
+    if (settings.ccd) sceneDesc.flags.raise(px.PxSceneFlagEnum.eENABLE_CCD);
+    const colliders = [...d.staticColliders, ...d.bodies.flatMap((b) => b.colliders)];
+    this.colliderIds = new Map(colliders.map((c, i) => [c, i]));
+    const collides = collisionFilter(d);
+    if (collides) {
+      // CollisionGroups and FilteredPairsAPI decide per collider pair.
+      this.filterShader = setFilterShader(px, sceneDesc, (a, b) => !colliders[a] || !colliders[b] || collides(colliders[a], colliders[b]));
+    } else {
+      sceneDesc.filterShader = px.DefaultFilterShader();
+    }
     this.scene = rt.physics.createScene(sceneDesc);
     px.destroy(gravity);
     px.destroy(sceneDesc);
@@ -201,10 +221,14 @@ export class PhysXEngine implements PhysicsEngine {
 
   private material(c: ColliderInfo): PhysX.PxMaterial {
     const m = c.material;
-    const key = `${m.staticFriction}|${m.dynamicFriction}|${m.restitution}`;
+    const key = `${m.staticFriction}|${m.dynamicFriction}|${m.restitution}|${m.frictionCombine}|${m.restitutionCombine}`;
     let mat = this.materials.get(key);
     if (!mat) {
       mat = this.rt.physics.createMaterial(m.staticFriction, m.dynamicFriction, m.restitution);
+      const Combine = this.px.PxCombineModeEnum;
+      const mode = { average: Combine.eAVERAGE, min: Combine.eMIN, multiply: Combine.eMULTIPLY, max: Combine.eMAX };
+      if (m.frictionCombine) mat.setFrictionCombineMode(mode[m.frictionCombine]);
+      if (m.restitutionCombine) mat.setRestitutionCombineMode(mode[m.restitutionCombine]);
       this.materials.set(key, mat);
     }
     return mat;
@@ -267,7 +291,9 @@ export class PhysXEngine implements PhysicsEngine {
     px.destroy(geometry);
     // The binding's DefaultFilterShader collides a pair only when
     // (word0 of one) & (word1 of the other) != 0; zeroed filter data never collides.
-    const filter = new px.PxFilterData(1, 0xffffffff, 0, 0);
+    // word2 holds extra pair flags (swept CCD), word3 the collider id for setFilterShader.
+    const ccd = this.description.physxScene.ccd && c.body?.kind === "dynamic" && c.body.physx.ccd;
+    const filter = new px.PxFilterData(1, 0xffffffff, ccd ? px.PxPairFlagEnum.eDETECT_CCD_CONTACT : 0, this.colliderIds.get(c) ?? 0xffffffff);
     shape.setSimulationFilterData(filter);
     px.destroy(filter);
 
@@ -278,9 +304,9 @@ export class PhysXEngine implements PhysicsEngine {
     shape.setLocalPose(local);
     px.destroy(local);
     // Default contact offsets (2 cm) swallow centimetre-scale objects.
-    const contact = Math.min(0.02, Math.max(0.001, shapeSize(c) * 0.2));
+    const contact = c.contactOffset ?? Math.min(0.02, Math.max(0.001, shapeSize(c) * 0.2));
     shape.setContactOffset(contact);
-    shape.setRestOffset(0);
+    shape.setRestOffset(Math.min(c.restOffset ?? 0, contact * 0.99));
     actor.attachShape(shape);
     shape.release();
   }
@@ -317,7 +343,22 @@ export class PhysXEngine implements PhysicsEngine {
       actor.setAngularVelocity(w);
       px.destroy(v);
       px.destroy(w);
-      actor.setSolverIterationCounts(8, 2);
+      const settings = this.description.physxScene;
+      const p = body.physx;
+      const clamp = (n: number, [lo, hi]: [number, number]) => Math.min(Math.max(Math.round(n), lo), hi);
+      actor.setSolverIterationCounts(
+        clamp(p.positionIterations ?? DEFAULT_POSITION_ITERATIONS, settings.positionIterations),
+        clamp(p.velocityIterations ?? DEFAULT_VELOCITY_ITERATIONS, settings.velocityIterations),
+      );
+      if (p.linearDamping !== undefined) actor.setLinearDamping(p.linearDamping);
+      if (p.angularDamping !== undefined) actor.setAngularDamping(p.angularDamping);
+      if (p.maxLinearVelocity !== undefined) actor.setMaxLinearVelocity(p.maxLinearVelocity);
+      if (p.maxAngularVelocity !== undefined) actor.setMaxAngularVelocity(p.maxAngularVelocity);
+      if (p.maxDepenetrationVelocity !== undefined) actor.setMaxDepenetrationVelocity(p.maxDepenetrationVelocity);
+      if (p.sleepThreshold !== undefined) actor.setSleepThreshold(p.sleepThreshold);
+      if (p.stabilizationThreshold !== undefined) actor.setStabilizationThreshold(p.stabilizationThreshold);
+      if (p.ccd && settings.ccd) actor.setRigidBodyFlag(px.PxRigidBodyFlagEnum.eENABLE_CCD, true);
+      if (p.speculativeCcd) actor.setRigidBodyFlag(px.PxRigidBodyFlagEnum.eENABLE_SPECULATIVE_CCD, true);
     }
     this.scene!.addActor(actor);
     return actor;
@@ -379,26 +420,32 @@ export class PhysXEngine implements PhysicsEngine {
     const Motion = px.PxD6MotionEnum;
     const DriveAxis = px.PxD6DriveEnum;
     d6.setAngularDriveConfig(px.PxD6AngularDriveConfigEnum.eSWING_TWIST);
-    const noSpring = () => new px.PxSpring(0, 0);
+    // Soft limits (physxLimit stiffness/damping) are limits with a spring.
+    type SpringName = keyof JointInfo["limitSprings"];
+    const springOf = (name: SpringName) => new px.PxSpring(j.limitSprings[name]?.stiffness ?? 0, j.limitSprings[name]?.damping ?? 0);
 
-    const angularPair = (lower: number | undefined, upper: number | undefined) => {
+    const angularPair = (lower: number | undefined, upper: number | undefined, springName: SpringName) => {
       const lo = finite(lower) ? lower : -Math.PI * 2 + 1e-3;
       const hi = finite(upper) ? upper : Math.PI * 2 - 1e-3;
-      const limit = new px.PxJointAngularLimitPair(Math.max(lo, -Math.PI * 2 + 1e-3), Math.min(hi, Math.PI * 2 - 1e-3));
+      const spring = springOf(springName);
+      const limit = new px.PxJointAngularLimitPair(Math.max(lo, -Math.PI * 2 + 1e-3), Math.min(hi, Math.PI * 2 - 1e-3), spring);
       d6.setTwistLimit(limit);
       px.destroy(limit);
+      px.destroy(spring);
     };
-    const linearPair = (axis: number, lower: number | undefined, upper: number | undefined) => {
-      const spring = noSpring();
+    const linearPair = (axis: number, lower: number | undefined, upper: number | undefined, springName: SpringName) => {
+      const spring = springOf(springName);
       const limit = new px.PxJointLinearLimitPair(finite(lower) ? lower : -PX_MAX_F32, finite(upper) ? upper : PX_MAX_F32, spring);
       d6.setLinearLimit(axis, limit);
       px.destroy(limit);
       px.destroy(spring);
     };
-    const cone = (y: number, z: number) => {
-      const limit = new px.PxJointLimitCone(Math.min(y, Math.PI - 1e-3), Math.min(z, Math.PI - 1e-3));
+    const cone = (y: number, z: number, springName: SpringName) => {
+      const spring = springOf(springName);
+      const limit = new px.PxJointLimitCone(Math.min(y, Math.PI - 1e-3), Math.min(z, Math.PI - 1e-3), spring);
       d6.setSwingLimit(limit);
       px.destroy(limit);
+      px.destroy(spring);
     };
     const drive = (axis: number, dr: JointDrive) => {
       const pd = new px.PxD6JointDrive(dr.stiffness, dr.damping, finite(dr.maxForce) ? dr.maxForce : PX_MAX_F32, dr.type === "acceleration");
@@ -411,14 +458,14 @@ export class PhysXEngine implements PhysicsEngine {
       case "revolute": {
         const limited = finite(j.lower) || finite(j.upper);
         d6.setMotion(Axis.eTWIST, limited ? Motion.eLIMITED : Motion.eFREE);
-        if (limited) angularPair(j.lower, j.upper);
+        if (limited) angularPair(j.lower, j.upper, "angular");
         if (j.drives.angular) drive(DriveAxis.eTWIST, j.drives.angular);
         break;
       }
       case "prismatic": {
         const limited = finite(j.lower) || finite(j.upper);
         d6.setMotion(Axis.eX, limited ? Motion.eLIMITED : Motion.eFREE);
-        if (limited) linearPair(Axis.eX, j.lower, j.upper);
+        if (limited) linearPair(Axis.eX, j.lower, j.upper, "linear");
         if (j.drives.linear) drive(DriveAxis.eX, j.drives.linear);
         break;
       }
@@ -428,7 +475,7 @@ export class PhysXEngine implements PhysicsEngine {
         d6.setMotion(Axis.eSWING1, limited ? Motion.eLIMITED : Motion.eFREE);
         d6.setMotion(Axis.eSWING2, limited ? Motion.eLIMITED : Motion.eFREE);
         // cone0 swings toward the second axis (about Z), cone1 toward the third (about Y).
-        if (limited) cone(j.cone1 ?? Math.PI, j.cone0 ?? Math.PI);
+        if (limited) cone(j.cone1 ?? Math.PI, j.cone0 ?? Math.PI, "angular");
         break;
       }
       case "fixed":
@@ -450,14 +497,18 @@ export class PhysXEngine implements PhysicsEngine {
         }
         for (const dof of ["transX", "transY", "transZ"] as const) {
           const lim = j.dofLimits?.[dof];
-          if (lim && lim.low <= lim.high) linearPair(map[dof], lim.low, lim.high);
+          if (lim && lim.low <= lim.high) linearPair(map[dof], lim.low, lim.high, dof);
         }
         const twist = j.dofLimits?.rotX;
-        if (twist && twist.low <= twist.high) angularPair(twist.low, twist.high);
+        if (twist && twist.low <= twist.high) angularPair(twist.low, twist.high, "rotX");
         const swingY = j.dofLimits?.rotY;
         const swingZ = j.dofLimits?.rotZ;
         if ((swingY && swingY.low <= swingY.high) || (swingZ && swingZ.low <= swingZ.high)) {
-          cone(swingY ? Math.max(Math.abs(swingY.low), Math.abs(swingY.high)) : Math.PI, swingZ ? Math.max(Math.abs(swingZ.low), Math.abs(swingZ.high)) : Math.PI);
+          cone(
+            swingY ? Math.max(Math.abs(swingY.low), Math.abs(swingY.high)) : Math.PI,
+            swingZ ? Math.max(Math.abs(swingZ.low), Math.abs(swingZ.high)) : Math.PI,
+            j.limitSprings.rotY ? "rotY" : "rotZ",
+          );
         }
         const driveAxis: Record<Dof, number> = {
           transX: DriveAxis.eX,
@@ -610,6 +661,8 @@ export class PhysXEngine implements PhysicsEngine {
     this.staticByCollider.clear();
     this.scene?.release();
     this.scene = null;
+    if (this.filterShader) this.px.destroy(this.filterShader);
+    this.filterShader = null;
     for (const mesh of this.meshes.splice(0)) mesh.release();
     for (const m of this.materials.values()) m.release();
     this.materials.clear();

@@ -291,6 +291,19 @@ def anchor_static_joints(stage: Usd.Stage) -> list[tuple[str, str]]:
 GENERIC_JOINT_DOFS = ("transX", "transY", "transZ", "rotX", "rotY", "rotZ")
 
 
+def breakable_joint_count(stage: Usd.Stage) -> int:
+    """Joints with a finite physics:breakForce or breakTorque; Newton 1.7 cannot break joints."""
+    count = 0
+    for prim in stage.Traverse():
+        if not prim.IsA(UsdPhysics.Joint):
+            continue
+        joint = UsdPhysics.Joint(prim)
+        limits = (joint.GetBreakForceAttr().Get(), joint.GetBreakTorqueAttr().Get())
+        # 3.4e38 (FLT_MAX) is the authored spelling of "unbreakable".
+        count += any(v is not None and math.isfinite(v) and v < UNLIMITED_FORCE for v in limits)
+    return count
+
+
 def free_unlimited_generic_axes(stage: Usd.Stage) -> None:
     """Give generic joints an unbounded limit on every DOF without a LimitAPI.
 
@@ -589,6 +602,11 @@ class Simulation:
         # Drop the importer's "attachment not imported" notes for attachments handled above.
         messages = {str(w.message) for w in caught}
         self.warnings = sorted({m for m in messages if not any(m.startswith(p + ":") for p in pinned)} | set(problems))
+        breakable = breakable_joint_count(stage)
+        if breakable:
+            self.warnings.append(
+                f"조인트 {breakable}개의 파단 힘(physics:breakForce)은 Newton에서 지원하지 않아 끊어지지 않습니다. 끊기는 동작은 PhysX 엔진으로 확인하세요."
+            )
         self.cloths = [
             {"path": path, "start": int(r["particle"][0]), "count": int(r["particle"][1] - r["particle"][0])}
             for path, r in result.get("path_cloth_map", {}).items()
