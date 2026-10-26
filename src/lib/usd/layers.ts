@@ -56,12 +56,14 @@ export function parseLayer(path: string, bytes: Uint8Array): ParsedLayer {
 // ---------------------------------------------------------------- USDA text
 
 const OVER_MARK = "__viewerOver";
+const CLASS_MARK = "__viewerClass";
 const INACTIVE_ATTR = "__viewerInactive";
 
 /**
  * Rewrites USDA syntax the three parser ignores into forms it reads:
  * plain/append `references` and `apiSchemas`, list-edited `payload`, `over`
- * prims and `active = false`. The markers are resolved again in postProcessUsda().
+ * and `class` prims, and `active = false`. The markers are resolved again in
+ * postProcessUsda().
  */
 function normalizeUsdaText(text: string): string {
   return text
@@ -69,6 +71,7 @@ function normalizeUsdaText(text: string): string {
     .replace(/^(\s*)(?:add\s+|append\s+)?apiSchemas(\s*=)/gm, "$1prepend apiSchemas$2")
     .replace(/^(\s*)(?:prepend|append|add)\s+payload(\s*=)/gm, "$1payload$2")
     .replace(/^(\s*)over\s+(?:(\w+)\s+)?"/gm, (_m, ws: string, type?: string) => `${ws}def ${type ?? ""}${OVER_MARK} "`)
+    .replace(/^(\s*)class\s+(?:(\w+)\s+)?"/gm, (_m, ws: string, type?: string) => `${ws}def ${type ?? ""}${CLASS_MARK} "`)
     .replace(/^(\s*)active\s*=\s*false\s*$/gm, `$1bool ${INACTIVE_ATTR} = 1`)
     // `custom` marks attributes outside any schema; three would take it for the type name.
     .replace(/^(\s*)custom\s+(?=\S)/gm, "$1");
@@ -84,6 +87,9 @@ function postProcessUsda(data: USDLayerData): void {
       if (typeof typeName === "string" && typeName.endsWith(OVER_MARK)) {
         spec.fields.typeName = typeName.slice(0, -OVER_MARK.length);
         spec.fields.specifier = Specifier.Over;
+      } else if (typeof typeName === "string" && typeName.endsWith(CLASS_MARK)) {
+        spec.fields.typeName = typeName.slice(0, -CLASS_MARK.length);
+        spec.fields.specifier = Specifier.Class;
       } else {
         spec.fields.specifier = Specifier.Def;
       }
@@ -216,9 +222,10 @@ function mergeWeaker(strong: Record<string, USDSpec>, weak: Record<string, USDSp
     const hasValue = "default" in sf || "timeSamples" in sf;
     for (const key in w.fields) {
       const wv = w.fields[key];
-      if (key === "primChildren" && Array.isArray(wv)) {
-        const own = Array.isArray(sf.primChildren) ? (sf.primChildren as string[]) : [];
-        sf.primChildren = [...own, ...(wv as string[]).filter((c) => !own.includes(c))];
+      if ((key === "primChildren" || key === "properties" || key === "apiSchemas") && Array.isArray(wv)) {
+        // Name lists and applied schemas compose; the stronger layer's order comes first.
+        const own = Array.isArray(sf[key]) ? (sf[key] as unknown[]) : [];
+        sf[key] = [...own, ...(wv as unknown[]).filter((c) => !own.includes(c))];
       } else if (key === "typeName") {
         if (!sf.typeName) sf.typeName = wv;
       } else if (key === "specifier") {
@@ -256,6 +263,80 @@ function primPartOf(path: string): string {
   const lastSlash = path.lastIndexOf("/");
   const dot = path.indexOf(".", Math.max(lastSlash, path.lastIndexOf("}")));
   return dot >= 0 ? path.slice(0, dot) : path;
+}
+
+// ---------------------------------------------------------------- internal references
+
+/** A path equal to `root` or inside its namespace (children, properties, variants). */
+function isUnder(path: string, root: string): boolean {
+  return path === root || (path.startsWith(root) && "/.{".includes(path[root.length]));
+}
+
+const EXTERNAL_ARC = /@[^@]*@(?:<[^>]*>)?/g;
+
+/** A references value's external arcs (`@asset@<prim>`) and internal targets (`</prim>`), strongest first. */
+function splitReferences(value: unknown): { external: string[]; internal: string[] } {
+  const text = (Array.isArray(value) ? value : [value]).filter((v): v is string => typeof v === "string").join(", ");
+  const external = [...text.matchAll(EXTERNAL_ARC)].map((m) => m[0]);
+  const internal = [...text.replace(EXTERNAL_ARC, "").matchAll(/<([^>]+)>/g)].map((m) => m[1]);
+  return { external, internal };
+}
+
+function retarget(path: string, from: string, to: string): string {
+  const bare = path.replace(/^<|>$/g, "");
+  if (!isUnder(bare, from)) return path;
+  const mapped = to + bare.slice(from.length);
+  return path.startsWith("<") ? `<${mapped}>` : mapped;
+}
+
+/**
+ * Compose internal references (`references = </Path>`, no asset), which three
+ * ignores: the target prim's specs are copied under the referencing prim as
+ * weaker opinions, with relationship targets and connections inside the
+ * target re-targeted, as USD composes them. Runs before pruning, because the
+ * targets often live under `class` prims that are not drawn themselves.
+ */
+function composeInternalReferences(specs: Record<string, USDSpec>): void {
+  const hasInternal = (path: string) => splitReferences(specs[path]?.fields.references).internal.length > 0;
+  const done = new Set<string>();
+  const resolving = new Set<string>();
+
+  const resolve = (path: string) => {
+    if (done.has(path) || resolving.has(path)) return;
+    const spec = specs[path];
+    if (!spec || !hasInternal(path)) {
+      done.add(path);
+      return;
+    }
+    resolving.add(path);
+    const { external, internal } = splitReferences(spec.fields.references);
+    for (const target of internal) {
+      // A missing target, or one around or inside the referencing prim, composes nothing.
+      if (!specs[target] || isUnder(path, target) || isUnder(target, path)) continue;
+      // Compose the target's own internal references first, so what is copied is final.
+      for (const p of Object.keys(specs)) if (isUnder(p, target) && specs[p].specType === SpecType.Prim && hasInternal(p)) resolve(p);
+      const weak: Record<string, USDSpec> = {};
+      for (const p in specs) {
+        if (!isUnder(p, target)) continue;
+        const fields = { ...specs[p].fields };
+        for (const key of ["targetPaths", "connectionPaths"]) {
+          const paths = fields[key];
+          if (Array.isArray(paths)) fields[key] = paths.map((t) => (typeof t === "string" ? retarget(t, target, path) : t));
+        }
+        weak[path + p.slice(target.length)] = { specType: specs[p].specType, fields };
+      }
+      // The target's external arcs come after the referencing prim's own (weaker).
+      external.push(...splitReferences(weak[path].fields.references).external);
+      delete weak[path].fields.references;
+      mergeWeaker(specs, weak);
+    }
+    if (external.length) spec.fields.references = [external.join(", ")];
+    else delete spec.fields.references;
+    resolving.delete(path);
+    done.add(path);
+  };
+
+  for (const path of Object.keys(specs)) if (specs[path]?.specType === SpecType.Prim) resolve(path);
 }
 
 /** Drop prims USD would not draw: inactive, or never `def`ined (over/class only). */
@@ -324,6 +405,7 @@ export function flattenLayerStack(
 
   const specs = flatten(rootPath, new Set([rootPath]));
   if (specs["/"]) delete specs["/"].fields.subLayers;
+  composeInternalReferences(specs);
   pruneUndefinedPrims(specs);
   return { data: { specsByPath: specs }, sublayers: used };
 }

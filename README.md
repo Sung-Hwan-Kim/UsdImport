@@ -92,7 +92,7 @@ npm run build && npm start
 ## 지원 기능
 
 - USDA(ASCII), USDC(Crate 바이너리), USD(둘 중 하나), USDZ(패키지)
-- 합성(Composition): `references`(defaultPrim / 프림 지정), `payload`, `subLayers`(스택 병합, `over` 오버라이드), USDC `variantSets`
+- 합성(Composition): `references`(defaultPrim / 프림 지정, 같은 파일 안의 `</Path>` 내부 참조 포함), `payload`, `subLayers`(스택 병합, `over` 오버라이드), USDC `variantSets`
 - `active = false`, `visibility = invisible`, `purpose = guide`, 그리고 `over`나 `class`로만 존재하는 프림은 USD와 같이 렌더링에서 제외
 - UsdGeom Mesh / Cube / Sphere / Cylinder / Cone / Capsule, GeomSubset 멀티 머티리얼
 - UsdPreviewSurface / OpenPBR 머티리얼과 텍스처(PNG/JPG/WebP/AVIF), 머티리얼이 없는 프림의 `displayColor`·`displayOpacity`(Cube·Sphere 등 포함)
@@ -131,6 +131,9 @@ scripts/generate_samples.py   public/samples 생성 스크립트 (`pip install u
   인라인된 `Vec3d`/`Vec3h` 값, 경로 개수와 인코딩된 경로 개수가 다른 경로 테이블 처리
 - 합성: subLayer 스택, defaultPrim/프림 지정 references, 중첩 참조의 텍스처·애니메이션 전달,
   GeomSubset에 속하지 않은 면, 바인딩되지 않은 메시, UsdLux 라이트의 방향과 exposure
+- 내부 참조: three는 에셋 경로 없는 `</Path>` 참조를 무시하므로, 레이어 스택을 합칠 때 대상 프림의 스펙을 참조하는 프림 아래로
+  복사해 약한 의견으로 합성합니다(대상 안을 가리키는 관계·연결 경로도 옮김). 대상은 보통 그려지지 않는 `class` 프림 아래에
+  있어서 정리 전에 합성하며, USDA의 `class` 블록도 읽도록 보완했습니다
 - 머티리얼: three는 `displayColor`를 Mesh 프림에만 적용하므로, 바인딩되지 않은 모든 지오메트리의 기본 머티리얼에 직접 반영
 - 애니메이션: three의 트랜스폼 클립은 일부 op 이름만, Xform/Scope/Mesh 프림만 다루고 트랙을 프림 이름으로 묶어
   같은 이름의 프림이 모두 첫 번째 프림을 움직였으므로, 스테이지 전체의 트랜스폼 클립을 직접 만들어 오브젝트 uuid로 묶음
@@ -140,7 +143,7 @@ scripts/generate_samples.py   public/samples 생성 스크립트 (`pip install u
 
 ## 알려진 제한 사항
 
-- 표시: USDA의 `variantSet` 블록, `inherits` / `specializes`, 내부 참조(에셋 없는 `</Path>`)는 지원하지 않습니다
+- 표시: USDA의 `variantSet` 블록, `inherits` / `specializes`, 같은 파일 안의 내부 payload는 지원하지 않습니다
   (저장은 이것들을 모두 그대로 유지합니다)
 - DomeLight(HDR 환경 조명), PointInstancer, BasisCurves / Points, UDIM, EXR/TIFF 텍스처는 지원하지 않습니다
 - 큰 파일은 메인 스레드에서 파싱하므로 로딩 중 UI가 잠깐 멈출 수 있습니다

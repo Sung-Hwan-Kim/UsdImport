@@ -41,7 +41,9 @@ interface AssetArc {
   primPath: string;
 }
 
+/** An internal arc (no asset path) is kept as `<prim>`, as USDA writes it; layers.ts composes those. */
 function encodeArc(arc: AssetArc): string {
+  if (!arc.assetPath) return `<${arc.primPath}>`;
   return `@${arc.assetPath}@${arc.primPath ? `<${arc.primPath}>` : ""}`;
 }
 
@@ -89,7 +91,7 @@ export class CrateParser extends USDCParser {
     if (halves) return Array.from({ length: halves }, () => this._readHalf());
     switch (type) {
       case ReferenceListOp: {
-        const arcs = this.readListOp(() => this.readReference()).filter((a) => a.assetPath);
+        const arcs = this.readListOp(() => this.readReference()).filter((a) => a.assetPath || a.primPath);
         return arcs.length ? [arcs.map(encodeArc).join(", ")] : null;
       }
       case PayloadListOp: {
