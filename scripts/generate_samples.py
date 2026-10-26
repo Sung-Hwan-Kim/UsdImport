@@ -926,6 +926,110 @@ def sample_physics_dominoes():
     return path
 
 
+def grid_mesh(stage, path, width, height, nx, ny, origin, axis_u, axis_v):
+    """A double-sided nx x ny quad grid from `origin`, `width` along axis_u and `height` along axis_v."""
+    mesh = UsdGeom.Mesh.Define(stage, path)
+    points, uvs = [], []
+    for j in range(ny + 1):
+        for i in range(nx + 1):
+            u, v = i / nx, j / ny
+            points.append(Gf.Vec3f(*[origin[k] + axis_u[k] * u * width + axis_v[k] * v * height for k in range(3)]))
+            uvs.append(Gf.Vec2f(u * width, v * height))
+    indices = []
+    for j in range(ny):
+        for i in range(nx):
+            a = j * (nx + 1) + i
+            indices += [a, a + 1, a + nx + 2, a + nx + 1]
+    mesh.CreatePointsAttr(points)
+    mesh.CreateFaceVertexCountsAttr([4] * (nx * ny))
+    mesh.CreateFaceVertexIndicesAttr(indices)
+    mesh.CreateExtentAttr(UsdGeom.PointBased.ComputeExtent(points))
+    mesh.CreateDoubleSidedAttr(True)
+    mesh.CreateSubdivisionSchemeAttr("none")
+    UsdGeom.PrimvarsAPI(mesh).CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex).Set(uvs)
+    return mesh
+
+
+def cloth(mesh, thickness, material):
+    """Surface deformable (AOUSD deformable proposal, as read by Newton 1.7)."""
+    prim = mesh.GetPrim()
+    for api in ("PhysicsDeformableBodyAPI", "PhysicsSurfaceDeformableSimAPI", "PhysicsCollisionAPI"):
+        prim.AddAppliedSchema(api)
+    prim.CreateAttribute("physics:thicknesses", Sdf.ValueTypeNames.FloatArray).Set([thickness])
+    prim.CreateAttribute("physics:thicknesses:elementType", Sdf.ValueTypeNames.Token).Set("constant")
+    bind_physics(prim, material)
+    return prim
+
+
+def cloth_material(stage, path, density, youngs_modulus, poissons_ratio=0.3):
+    mat = UsdShade.Material.Define(stage, path)
+    prim = mat.GetPrim()
+    prim.AddAppliedSchema("PhysicsSurfaceDeformableMaterialAPI")
+    prim.CreateAttribute("physics:density", Sdf.ValueTypeNames.Float).Set(density)
+    prim.CreateAttribute("physics:youngsModulus", Sdf.ValueTypeNames.Float).Set(youngs_modulus)
+    prim.CreateAttribute("physics:poissonsRatio", Sdf.ValueTypeNames.Float).Set(poissons_ratio)
+    return mat
+
+
+def sample_physics_cloth():
+    """ASCII .usda: surface deformables (cloth) for Newton -- a tablecloth, a pinned curtain and rigid bodies."""
+    path = os.path.join(OUT, "physics_cloth.usda")
+    stage = Usd.Stage.CreateNew(path)
+    UsdGeom.Xform.Define(stage, "/World")
+    physics_scene(stage, "/World/PhysicsScene", (0, -1, 0), 9.81)
+    looks = "/World/Looks"
+    concrete = make_material(stage, looks + "/Concrete", (0.55, 0.56, 0.58), 0.0, 0.85)
+    wood = make_material(stage, looks + "/Wood", texture="./props/textures/wood.png", roughness=0.6)
+    linen = make_material(stage, looks + "/Linen", texture="./textures/checker.png", roughness=0.9)
+    velvet = make_material(stage, looks + "/Velvet", (0.55, 0.08, 0.12), 0.0, 0.8)
+    rubber = make_material(stage, looks + "/RedRubber", (0.85, 0.12, 0.1), 0.0, 0.5)
+    steel = make_material(stage, looks + "/Steel", (0.75, 0.76, 0.78), 1.0, 0.3)
+
+    fabric = cloth_material(stage, "/World/PhysicsMaterials/Cotton", density=300.0, youngs_modulus=2.0e5)
+    heavy = cloth_material(stage, "/World/PhysicsMaterials/Velvet", density=400.0, youngs_modulus=1.0e5)
+
+    collider(box(stage, "/World/Ground", (10, 0.2, 8), (0, -0.1, 0), concrete))
+    collider(box(stage, "/World/Table", (1.2, 0.75, 0.8), (0, 0.375, 0), wood))
+
+    # A tablecloth dropped over the table, then a ball dropped onto it.
+    cloth(grid_mesh(stage, "/World/Tablecloth", 1.6, 1.6, 40, 40, (-0.8, 1.0, 0.8), (1, 0, 0), (0, 0, -1)), 0.004, fabric)
+    bind(stage.GetPrimAtPath("/World/Tablecloth"), linen)
+    ball = sphere(stage, "/World/Ball", 0.12, (0.15, 1.6, 0.1), rubber)
+    rigid(ball, mass=1.0)
+
+    # A curtain hanging from a rod: its top row is attached to the rod (pinned in place).
+    nx, ny = 30, 36
+    curtain = grid_mesh(stage, "/World/Curtain", 1.2, 1.4, nx, ny, (-2.6, 0.4, -1.2), (1, 0, 0), (0, 1, 0))
+    cloth(curtain, 0.004, heavy)
+    bind(curtain, velvet)
+    rod = UsdGeom.Cylinder.Define(stage, "/World/CurtainRod")
+    rod.CreateRadiusAttr(0.02)
+    rod.CreateHeightAttr(1.4)
+    rod.CreateAxisAttr("X")
+    rod.AddTranslateOp().Set(Gf.Vec3d(-2.0, 1.82, -1.2))
+    bind(rod, steel)
+    top = [ny * (nx + 1) + i for i in range(nx + 1)]
+    pins = stage.DefinePrim("/World/CurtainPins", "PhysicsAttachment")
+    pins.CreateRelationship("physics:src0").SetTargets(["/World/Curtain"])
+    pins.CreateRelationship("physics:src1").SetTargets(["/World/CurtainRod"])
+    pins.CreateAttribute("physics:type0", Sdf.ValueTypeNames.Token).Set("point")
+    pins.CreateAttribute("physics:type1", Sdf.ValueTypeNames.Token).Set("xform")
+    pins.CreateAttribute("physics:indices0", Sdf.ValueTypeNames.IntArray).Set(top)
+    points = curtain.GetPointsAttr().Get()
+    pins.CreateAttribute("physics:coords1", Sdf.ValueTypeNames.Point3fArray).Set(
+        [Gf.Vec3f(points[i]) - Gf.Vec3f(-2.0, 1.82, -1.2) for i in top]
+    )
+
+    # Crates to push into the curtain with the mouse.
+    for i, x in enumerate((-2.4, -1.7)):
+        crate = box(stage, f"/World/Crate_{i + 1}", (0.3, 0.3, 0.3), (x, 0.15, -0.5), wood)
+        rigid(crate, mass=2.0)
+
+    set_stage_meta(stage, "Y", 1.0, "/World")
+    stage.GetRootLayer().Save()
+    return path
+
+
 def main():
     os.makedirs(os.path.join(OUT, "textures"), exist_ok=True)
     os.makedirs(os.path.join(OUT, "props", "textures"), exist_ok=True)
@@ -946,6 +1050,7 @@ def main():
         sample_physics_playground(),
         sample_physics_joints(),
         sample_physics_dominoes(),
+        sample_physics_cloth(),
     ]
 
     usdz = os.path.join(OUT, "kitchen_packaged.usdz")

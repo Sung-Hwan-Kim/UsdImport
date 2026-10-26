@@ -69,7 +69,9 @@ function normalizeUsdaText(text: string): string {
     .replace(/^(\s*)(?:add\s+|append\s+)?apiSchemas(\s*=)/gm, "$1prepend apiSchemas$2")
     .replace(/^(\s*)(?:prepend|append|add)\s+payload(\s*=)/gm, "$1payload$2")
     .replace(/^(\s*)over\s+(?:(\w+)\s+)?"/gm, (_m, ws: string, type?: string) => `${ws}def ${type ?? ""}${OVER_MARK} "`)
-    .replace(/^(\s*)active\s*=\s*false\s*$/gm, `$1bool ${INACTIVE_ATTR} = 1`);
+    .replace(/^(\s*)active\s*=\s*false\s*$/gm, `$1bool ${INACTIVE_ATTR} = 1`)
+    // `custom` marks attributes outside any schema; three would take it for the type name.
+    .replace(/^(\s*)custom\s+(?=\S)/gm, "$1");
 }
 
 function postProcessUsda(data: USDLayerData): void {

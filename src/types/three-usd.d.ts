@@ -73,6 +73,7 @@ declare module "three/examples/jsm/loaders/usd/USDComposer.js" {
 
     applyTransform(obj: Object3D, fields: Record<string, unknown>, attrs?: Record<string, unknown>): void;
     protected _buildHierarchy(parent: Object3D, parentPath: string): void;
+    protected _buildMesh(path: string, spec: USDSpec): Mesh;
     protected _resolveReference(refValue: string, localVariants?: Record<string, string>): Group | null;
     protected _resolveFilePath(refPath: string): string;
     protected _getReferences(spec: USDSpec): string[];

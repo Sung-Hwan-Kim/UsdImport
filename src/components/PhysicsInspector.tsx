@@ -7,6 +7,7 @@ import {
   physicsDescriptionFor,
   type BodyInfo,
   type ColliderInfo,
+  type DeformableInfo,
   type JointDrive,
   type JointInfo,
   type PhysicsDescription,
@@ -128,6 +129,32 @@ function JointFields({ joint }: { joint: JointInfo }) {
   );
 }
 
+const DEFORMABLE_LABEL: Record<DeformableInfo["kind"], string> = {
+  surface: "천 (Surface Deformable)",
+  volume: "볼륨 Deformable",
+  curves: "커브 Deformable",
+};
+
+function DeformableFields({ deformable }: { deformable: DeformableInfo }) {
+  const m = deformable.material;
+  return (
+    <>
+      <Field label="Deformable">
+        {DEFORMABLE_LABEL[deformable.kind]} <Badge>{deformable.kind === "surface" ? "Newton" : "미지원"}</Badge>
+      </Field>
+      {deformable.thickness !== undefined && <Field label="두께">{n(deformable.thickness * 1000, 2)} mm</Field>}
+      {m.path && (
+        <Field label="물리 머티리얼" mono>
+          {m.path}
+        </Field>
+      )}
+      {m.density !== undefined && <Field label="밀도">{n(m.density, 1)} kg/m³</Field>}
+      {m.youngsModulus !== undefined && <Field label="영률">{n(m.youngsModulus, 0)} Pa</Field>}
+      {m.poissonsRatio !== undefined && <Field label="푸아송 비">{n(m.poissonsRatio, 2)}</Field>}
+    </>
+  );
+}
+
 function SceneFields({ description }: { description: PhysicsDescription }) {
   const g = description.gravity;
   return (
@@ -138,6 +165,7 @@ function SceneFields({ description }: { description: PhysicsDescription }) {
       {description.stepsPerSecond && <Field label="스텝 수">{description.stepsPerSecond} /s</Field>}
       <Field label="구성">
         바디 {description.bodies.length} · 정적 {description.staticColliders.length} · 조인트 {description.joints.length}
+        {description.deformables.length > 0 && ` · Deformable ${description.deformables.length}`}
       </Field>
     </>
   );
@@ -156,6 +184,7 @@ export default function PhysicsInspector({ stage, obj }: { stage: LoadedStage; o
       {info?.body && <BodyFields body={info.body} />}
       {info?.collider && <ColliderFields collider={info.collider} />}
       {info?.joint && <JointFields joint={info.joint} />}
+      {info?.deformable && <DeformableFields deformable={info.deformable} />}
     </Section>
   );
 }

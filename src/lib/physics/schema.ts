@@ -114,6 +114,18 @@ export interface JointInfo {
   breakTorque: number;
 }
 
+export type DeformableKind = "surface" | "volume" | "curves";
+
+/** Deformable simulation geometry (AOUSD deformable proposal); cloth is a "surface" deformable. */
+export interface DeformableInfo {
+  object: Object3D;
+  path: string;
+  kind: DeformableKind;
+  /** Simulation thickness (m), when authored as a constant. */
+  thickness?: number;
+  material: { path: string | null; density?: number; youngsModulus?: number; poissonsRatio?: number };
+}
+
 export interface PhysicsDescription {
   /** m/s² in world space */
   gravity: Vector3;
@@ -122,9 +134,10 @@ export interface PhysicsDescription {
   bodies: BodyInfo[];
   staticColliders: ColliderInfo[];
   joints: JointInfo[];
+  deformables: DeformableInfo[];
   warnings: string[];
   /** Lookup for the inspector. */
-  byObject: Map<Object3D, { body?: BodyInfo; collider?: ColliderInfo; joint?: JointInfo }>;
+  byObject: Map<Object3D, { body?: BodyInfo; collider?: ColliderInfo; joint?: JointInfo; deformable?: DeformableInfo }>;
 }
 
 const DEFAULT_MATERIAL: PhysicsMaterialInfo = { path: null, staticFriction: 0.5, dynamicFriction: 0.5, restitution: 0 };
@@ -137,6 +150,11 @@ const JOINT_TYPES: Record<string, JointType> = {
   PhysicsJoint: "generic",
 };
 const DOFS: Dof[] = ["transX", "transY", "transZ", "rotX", "rotY", "rotZ"];
+const DEFORMABLE_SIM_APIS: Record<string, DeformableKind> = {
+  PhysicsSurfaceDeformableSimAPI: "surface",
+  PhysicsVolumeDeformableSimAPI: "volume",
+  PhysicsCurvesDeformableSimAPI: "curves",
+};
 
 // ---------------------------------------------------------------- spec access
 
@@ -379,10 +397,49 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
     return DEFAULT_MATERIAL;
   };
 
+  // ---- deformables: simulated by Newton only; their geometry is never a rigid collider
+  const deformables: DeformableInfo[] = [];
+  root.traverse((obj) => {
+    if (obj === root) return;
+    const kind = reader.apis(obj).map((api) => DEFORMABLE_SIM_APIS[api]).find(Boolean);
+    if (!kind) return;
+    if (kind !== "surface") warnings.push(`${stagePathOf(obj)}: ${kind === "volume" ? "볼륨" : "커브"} Deformable은 아직 지원하지 않습니다.`);
+    const thicknesses = reader.attr(obj, "physics:thicknesses") as ArrayLike<number> | undefined;
+    const deformable: DeformableInfo = { object: obj, path: stagePathOf(obj), kind, material: { path: null } };
+    if (thicknesses?.length && reader.token(obj, "physics:thicknesses:elementType") !== "point") {
+      deformable.thickness = thicknesses[0] * unitScale;
+    }
+    for (let cur: Object3D | null = obj; cur && cur !== root; cur = cur.parent) {
+      const binding = reader.rel(cur, "material:binding:physics");
+      if (!binding) continue;
+      const path = binding.targets[0];
+      const num = (name: string) => {
+        const v = reader.attrAt(binding.tag, path, name);
+        return typeof v === "number" ? v : undefined;
+      };
+      const density = num("physics:density");
+      deformable.material = {
+        path,
+        density: density === undefined ? undefined : density / unitScale ** 3,
+        youngsModulus: num("physics:youngsModulus"),
+        poissonsRatio: num("physics:poissonsRatio"),
+      };
+      break;
+    }
+    deformables.push(deformable);
+    entry(obj).deformable = deformable;
+  });
+  const deformablePart = (obj: Object3D) => {
+    for (let cur: Object3D | null = obj; cur && cur !== root; cur = cur.parent) {
+      if (byObject.get(cur)?.deformable || reader.hasApi(cur, "PhysicsDeformableBodyAPI")) return true;
+    }
+    return false;
+  };
+
   // ---- colliders
   const staticColliders: ColliderInfo[] = [];
   root.traverse((obj) => {
-    if (obj === root || !reader.hasApi(obj, "PhysicsCollisionAPI")) return;
+    if (obj === root || !reader.hasApi(obj, "PhysicsCollisionAPI") || deformablePart(obj)) return;
     if (!reader.bool(obj, "physics:collisionEnabled", true)) return;
     const mesh = obj as Mesh;
     if (!mesh.isMesh) {
@@ -592,7 +649,12 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
     if (rate > 0) stepsPerSecond = rate;
   });
 
-  return { gravity, stepsPerSecond, bodies, staticColliders, joints, warnings, byObject };
+  return { gravity, stepsPerSecond, bodies, staticColliders, joints, deformables, warnings, byObject };
+}
+
+/** An attribute's authored value on an object's prim (default, else first time sample). */
+export function authoredAttribute(stage: LoadedStage, obj: Object3D, name: string): unknown {
+  return new SpecReader(stage).attr(obj, name);
 }
 
 const descriptions = new WeakMap<LoadedStage, PhysicsDescription>();

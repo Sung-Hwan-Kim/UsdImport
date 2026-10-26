@@ -85,9 +85,12 @@ export class PhysXEngine implements PhysicsEngine {
     this.description = description;
     if (description.stepsPerSecond) this.dt = 1 / description.stepsPerSecond;
     this.build();
+    const cloths = description.deformables.filter((d) => d.kind === "surface").length;
+    if (cloths) this.warnings.push(`천 ${cloths}개는 Newton 엔진에서만 시뮬레이션되며 PhysX에서는 움직이지 않습니다.`);
     return {
       bodies: description.bodies.map((b) => b.object),
       kinematic: description.bodies.map((b) => b.kind === "kinematic"),
+      cloths: [],
       frame: "world",
       dt: this.dt,
       label: `PhysX ${this.rt.version} · WASM`,
@@ -485,6 +488,10 @@ export class PhysXEngine implements PhysicsEngine {
     return this.poses;
   }
 
+  readParticles(): Float32Array | null {
+    return null;
+  }
+
   time(): number {
     return this.simTime;
   }
@@ -535,6 +542,10 @@ export class PhysXEngine implements PhysicsEngine {
     const t = pxTransform(this.px, target, new Quaternion());
     this.drag.anchor.setKinematicTarget(t);
     this.px.destroy(t);
+  }
+
+  dragParticle(): void {
+    // PhysX (WASM) has no deformables.
   }
 
   endDrag(): void {

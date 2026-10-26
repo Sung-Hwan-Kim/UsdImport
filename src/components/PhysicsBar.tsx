@@ -97,13 +97,15 @@ function StatusText() {
     return <span className="truncate text-faint">P 또는 ▶ 로 시작 · 시작 후 바디를 마우스로 끌어 잡기</span>;
   }
   const colliders = description.staticColliders.length + description.bodies.reduce((n, b) => n + b.colliders.length, 0);
+  const cloths = description.deformables.filter((d) => d.kind === "surface").length;
   return (
     <span
       className="truncate text-muted"
-      title={`${physics.label ?? ""}\n동적 바디를 마우스로 끌어 잡을 수 있습니다 (일시정지 중이면 재생이 이어집니다)`}
+      title={`${physics.label ?? ""}\n동적 바디나 천을 마우스로 끌어 잡을 수 있습니다 (일시정지 중이면 재생이 이어집니다)`}
     >
       <span className="text-fg">{physics.label}</span> · 바디 {description.bodies.length} · 콜라이더 {colliders} · 조인트{" "}
       {description.joints.length}
+      {cloths > 0 && ` · 천 ${cloths}`}
     </span>
   );
 }

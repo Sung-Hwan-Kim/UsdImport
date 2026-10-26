@@ -65,6 +65,13 @@ export const SAMPLES: Sample[] = [
     description: "Z-up · 센티미터 단위 물리 · 연쇄 충돌",
   },
   {
+    id: "cloth",
+    file: "physics_cloth.usda",
+    title: "Physics Cloth",
+    format: "USDA",
+    description: "Surface Deformable(천) · 고정된 커튼 · 리지드 바디 결합 (Newton)",
+  },
+  {
     id: "skinned",
     file: "skinned_tentacle.usda",
     title: "Skinned Tentacle",

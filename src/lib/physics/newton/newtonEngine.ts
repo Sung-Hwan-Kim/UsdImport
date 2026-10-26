@@ -1,8 +1,8 @@
-import { Object3D, type Vector3 } from "three";
+import { Object3D, type Mesh, type Vector3 } from "three";
 import { stagePathOf } from "../../scene";
 import type { LoadedStage } from "../../usd/loadStage";
 import type { AssetSource } from "../../usd/sources";
-import type { EngineLoadResult, PhysicsEngine } from "../engine";
+import type { ClothBinding, EngineLoadResult, PhysicsEngine } from "../engine";
 
 const CONNECT_TIMEOUT_MS = 5000;
 // The first load compiles Warp kernels, which can take a while.
@@ -11,6 +11,8 @@ const READY_TIMEOUT_MS = 180_000;
 interface ReadyMessage {
   type: "ready";
   bodies: string[];
+  /** Cloth meshes and their particle ranges. */
+  cloths?: { path: string; start: number; count: number }[];
   device: string;
   solver: string;
   dt: number;
@@ -41,8 +43,10 @@ export class NewtonEngine implements PhysicsEngine {
 
   private ws: WebSocket | null = null;
   private poses: Float32Array | null = null;
+  private particles: Float32Array | null = null;
   private simTime = 0;
   private drag: { index: number; local: [number, number, number] } | null = null;
+  private particleDrag = false;
   private closedByClient = false;
 
   constructor(
@@ -105,10 +109,17 @@ export class NewtonEngine implements PhysicsEngine {
       warnings.push(`${path}: 뷰어에서 해당 프림을 찾지 못해 표시하지 않습니다.`);
       return new Object3D();
     });
+    const cloths: ClothBinding[] = [];
+    for (const { path, start, count } of msg.cloths ?? []) {
+      const obj = byPath.get(path);
+      if ((obj as Mesh | undefined)?.isMesh) cloths.push({ object: obj!, start, count });
+      else warnings.push(`${path}: 뷰어에서 천 메시를 찾지 못해 표시하지 않습니다.`);
+    }
 
     return {
       bodies,
       kinematic: bodies.map(() => false),
+      cloths,
       frame: "stage",
       dt: msg.dt,
       label: `Newton · ${msg.device} · ${msg.solver.toUpperCase()}`,
@@ -170,12 +181,17 @@ export class NewtonEngine implements PhysicsEngine {
     };
   }
 
-  /** Frame layout: [simTime, bodyCount, bodyCount × (px, py, pz, qx, qy, qz, qw)]. */
+  /**
+   * Frame layout: [simTime, bodyCount, particleCount,
+   * bodyCount × (px, py, pz, qx, qy, qz, qw), particleCount × (x, y, z)].
+   */
   private acceptFrame(buffer: ArrayBuffer): void {
     const data = new Float32Array(buffer);
-    if (data.length < 2) return;
+    if (data.length < 3) return;
+    const poseEnd = 3 + data[1] * 7;
     this.simTime = data[0];
-    this.poses = data.subarray(2, 2 + data[1] * 7);
+    this.poses = data.subarray(3, poseEnd);
+    this.particles = data.subarray(poseEnd, poseEnd + data[2] * 3);
   }
 
   private send(message: object): void {
@@ -204,6 +220,10 @@ export class NewtonEngine implements PhysicsEngine {
     return this.poses;
   }
 
+  readParticles(): Float32Array | null {
+    return this.particles;
+  }
+
   time(): number {
     return this.simTime;
   }
@@ -222,9 +242,15 @@ export class NewtonEngine implements PhysicsEngine {
     this.send({ type: "drag", body: this.drag.index, local: this.drag.local, target: [target.x, target.y, target.z] });
   }
 
+  dragParticle(index: number, target: Vector3): void {
+    this.particleDrag = true;
+    this.send({ type: "drag_particle", particle: index, target: [target.x, target.y, target.z] });
+  }
+
   endDrag(): void {
-    if (!this.drag) return;
+    if (!this.drag && !this.particleDrag) return;
     this.drag = null;
+    this.particleDrag = false;
     this.send({ type: "drag_end" });
   }
 

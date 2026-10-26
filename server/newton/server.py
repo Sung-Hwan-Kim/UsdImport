@@ -1,8 +1,9 @@
 """Local NVIDIA Newton physics server for the USD web viewer.
 
 The browser uploads the stage's USD files over a WebSocket; this server
-composes them with OpenUSD, builds a Newton model from the UsdPhysics schema,
-steps it in real time and streams rigid body poses back.
+composes them with OpenUSD, builds a Newton model from the UsdPhysics schema
+(plus surface deformables, i.e. cloth), steps it in real time and streams rigid
+body poses and cloth particle positions back.
 
     python server/newton/server.py --device cuda:0
 
@@ -33,6 +34,22 @@ MAX_UPLOAD_BYTES = 1 << 30
 # Mouse spring as accelerations (1/s^2, 1/s), independent of body mass and stage units.
 DRAG_STIFFNESS = 400.0
 DRAG_DAMPING = 40.0
+# Cloth contact (VBD). Stiffness/damping are in kg/s^2 and kg/s, which do not depend
+# on the length unit; distances are given in meters and converted to stage units.
+CLOTH_CONTACT_KE = 1.0e4
+CLOTH_CONTACT_KD = 1.0e1
+CLOTH_CONTACT_MU = 0.5
+CLOTH_CONTACT_GAP = 0.01
+CLOTH_SELF_CONTACT_MARGIN = 0.01
+CLOTH_SELF_CONTACT_GAP = 0.005
+# Mouse spring on cloth as accelerations (1/s^2, 1/s), applied to every particle
+# within CLOTH_DRAG_RADIUS (m) of the grabbed one.
+CLOTH_DRAG_STIFFNESS = 6.0e4
+CLOTH_DRAG_DAMPING = 250.0
+CLOTH_DRAG_RADIUS = 0.05
+MAX_GRABBED_PARTICLES = 64
+# Linear air drag on cloth (1/s). Without it a swinging cloth barely loses energy.
+CLOTH_AIR_DRAG = 1.5
 
 
 @wp.kernel
@@ -60,6 +77,43 @@ def apply_drag(
     force = body_mass[i] * (stiffness * (drag_points[1] - point) - damping * velocity)
     # body_f: force at the COM, then torque, both in world frame.
     body_f[i] = body_f[i] + wp.spatial_vector(force, wp.cross(point - com, force))
+
+
+@wp.kernel
+def pull_particles(
+    grabbed: wp.array(dtype=int),
+    grabbed_count: wp.array(dtype=int),
+    offsets: wp.array(dtype=wp.vec3),
+    target: wp.array(dtype=wp.vec3),
+    stiffness: float,
+    damping: float,
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_qd: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_f: wp.array(dtype=wp.vec3),
+):
+    """Spring-damper pulling a grabbed cloth patch so each point keeps its offset from the target.
+
+    A force (not a teleport) keeps VBD's own contact history consistent; it is
+    integrated explicitly, so stiffness * dt^2 must stay well below 1.
+    """
+    tid = wp.tid()
+    if tid >= grabbed_count[0]:
+        return
+    i = grabbed[tid]
+    goal = target[0] + offsets[tid]
+    particle_f[i] = particle_f[i] + particle_mass[i] * (stiffness * (goal - particle_q[i]) - damping * particle_qd[i])
+
+
+@wp.kernel
+def air_drag(
+    drag: float,
+    particle_qd: wp.array(dtype=wp.vec3),
+    particle_mass: wp.array(dtype=float),
+    particle_f: wp.array(dtype=wp.vec3),
+):
+    i = wp.tid()
+    particle_f[i] = particle_f[i] - particle_mass[i] * drag * particle_qd[i]
 
 
 def _has_rigid_body(prim: Usd.Prim) -> bool:
@@ -112,6 +166,41 @@ def anchor_static_joints(stage: Usd.Stage) -> list[tuple[str, str]]:
     return pairs
 
 
+def pin_cloth_attachments(stage: Usd.Stage, builder: newton.ModelBuilder, result: dict) -> tuple[set[str], list[str]]:
+    """Pin cloth points that a PhysicsAttachment ties to a static xform (or the world).
+
+    Newton 1.7 parses cloth attachments but does not import them yet. A static
+    target cannot move, so its attached particles become kinematic (zero mass,
+    inactive). Returns the handled attachment paths and warnings for the rest.
+    """
+    cloth: dict[str, dict] = result.get("path_cloth_map", {})
+    handled: set[str] = set()
+    problems: list[str] = []
+    for path, attrs in result.get("path_attachment_attrs", {}).items():
+        sides = [(attrs.get("src0"), attrs.get("type0"), attrs.get("indices0")), (attrs.get("src1"), attrs.get("type1"), attrs.get("indices1"))]
+        for k in (0, 1):
+            src, kind, indices = sides[k]
+            target, target_kind, _ = sides[1 - k]
+            if src not in cloth or kind != "point":
+                continue
+            if target_kind != "xform":
+                problems.append(f"{path}: 천 Attachment의 대상 종류 '{target_kind}'는 지원하지 않아 건너뜁니다.")
+                break
+            target_prim = stage.GetPrimAtPath(target) if target and target != "/" else None
+            if target_prim is not None and _has_rigid_body(target_prim):
+                problems.append(f"{path}: 리지드 바디에 붙인 천 Attachment는 아직 지원하지 않아 건너뜁니다.")
+                break
+            start, end = cloth[src]["particle"]
+            for i in indices or []:
+                p = start + int(i)
+                if start <= p < end:
+                    builder.particle_mass[p] = 0.0
+                    builder.particle_flags[p] = int(builder.particle_flags[p]) & ~int(newton.ParticleFlags.ACTIVE)
+            handled.add(path)
+            break
+    return handled, problems
+
+
 class Simulation:
     """A Newton model built from one USD stage, stepped one rendered frame at a time."""
 
@@ -133,8 +222,17 @@ class Simulation:
         anchored = anchor_static_joints(stage)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            result = builder.add_usd(stage, load_visual_shapes=False, apply_up_axis_from_stage=False)
-        self.warnings = sorted({str(w.message) for w in caught})
+            result = builder.add_usd(
+                stage, load_visual_shapes=False, apply_up_axis_from_stage=False, return_deformable_results=True
+            )
+        pinned, problems = pin_cloth_attachments(stage, builder, result)
+        # Drop the importer's "attachment not imported" notes for attachments handled above.
+        messages = {str(w.message) for w in caught}
+        self.warnings = sorted({m for m in messages if not any(m.startswith(p + ":") for p in pinned)} | set(problems))
+        self.cloths = [
+            {"path": path, "start": int(r["particle"][0]), "count": int(r["particle"][1] - r["particle"][0])}
+            for path, r in result.get("path_cloth_map", {}).items()
+        ]
 
         # A joint pair never collides in UsdPhysics; keep that for static anchors too.
         shape_map: dict[str, int] = result.get("path_shape_map", {})
@@ -149,22 +247,43 @@ class Simulation:
                 for b in body_shapes:
                     builder.add_shape_collision_filter_pair(a, b)
 
+        # Cloth needs VBD (particles) coupled with AVBD (rigid bodies); VBD
+        # schedules its parallel solve by graph coloring, computed up front.
+        if self.cloths:
+            solver = "vbd"
+            builder.color(include_bending=True)
+
         # UsdPhysics joints outside a PhysicsArticulationRootAPI are not part of
-        # any articulation. XPBD solves joints as maximal-coordinate constraints,
+        # any articulation. XPBD/VBD solve joints as maximal-coordinate constraints,
         # so only the reduced-coordinate solvers need that validation.
         with wp.ScopedDevice(self.device):
             self.model = builder.finalize(device=self.device, skip_validation_joints=solver != "mujoco")
-        if self.model.body_count == 0:
-            raise RuntimeError("시뮬레이션할 리지드 바디가 없습니다.")
+        if self.model.body_count == 0 and not self.cloths:
+            raise RuntimeError("시뮬레이션할 리지드 바디나 천이 없습니다.")
 
         self.bodies = list(self.model.body_label)
         self.solver_name = solver
         if solver == "mujoco":
             self.solver = newton.solvers.SolverMuJoCo(self.model)
+        elif solver == "vbd":
+            unit = self.meters_per_unit
+            self.model.soft_contact_ke = CLOTH_CONTACT_KE
+            self.model.soft_contact_kd = CLOTH_CONTACT_KD
+            self.model.soft_contact_mu = CLOTH_CONTACT_MU
+            self.solver = newton.solvers.SolverVBD(
+                self.model,
+                iterations=10,
+                rigid_compliant_alm=True,
+                particle_enable_self_contact=True,
+                particle_self_contact_margin=CLOTH_SELF_CONTACT_MARGIN / unit,
+                particle_self_contact_gap=CLOTH_SELF_CONTACT_GAP / unit,
+            )
         else:
             self.solver = newton.solvers.SolverXPBD(self.model, iterations=8, enable_restitution=True)
 
         # Captured CUDA graphs ping-pong state_0/state_1, so keep the substep count even.
+        if solver == "vbd":
+            substeps = max(substeps, 10)
         self.substeps = max(2, substeps + (substeps % 2))
         self.frame_dt = 1.0 / fps
         self.sim_dt = self.frame_dt / self.substeps
@@ -177,10 +296,19 @@ class Simulation:
             newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
             self.initial = self.model.state()
             self.initial.assign(self.state_0)
-            self.pipeline = newton.CollisionPipeline(self.model)
+            if self.cloths:
+                self.pipeline = newton.CollisionPipeline(self.model, soft_contact_gap=CLOTH_CONTACT_GAP / self.meters_per_unit)
+            else:
+                self.pipeline = newton.CollisionPipeline(self.model)
             self.contacts = self.pipeline.contacts()
             self.drag_body = wp.array([-1], dtype=int)
             self.drag_points = wp.zeros(2, dtype=wp.vec3)
+            # The grabbed cloth patch: particles, their offsets from the grabbed one, the target.
+            self.grabbed = wp.zeros(MAX_GRABBED_PARTICLES, dtype=int)
+            self.grabbed_count = wp.zeros(1, dtype=int)
+            self.grabbed_offsets = wp.zeros(MAX_GRABBED_PARTICLES, dtype=wp.vec3)
+            self.grab_target = wp.zeros(1, dtype=wp.vec3)
+            self.grabbed_particle = -1
 
             self.graph = None
             if self.device.is_cuda:
@@ -189,24 +317,53 @@ class Simulation:
                 self.graph = capture.graph
 
     def _simulate(self) -> None:
+        if self.cloths:
+            # Cloth deforms a lot between frames; a rebuilt self-contact BVH stays efficient.
+            self.solver.rebuild_bvh(self.state_0)
         for _ in range(self.substeps):
             self.state_0.clear_forces()
-            wp.launch(
-                apply_drag,
-                dim=1,
-                inputs=[
-                    self.state_0.body_q,
-                    self.state_0.body_qd,
-                    self.model.body_com,
-                    self.model.body_mass,
-                    self.drag_body,
-                    self.drag_points,
-                    DRAG_STIFFNESS,
-                    DRAG_DAMPING,
-                ],
-                outputs=[self.state_0.body_f],
-                device=self.device,
-            )
+            if self.model.body_count:
+                wp.launch(
+                    apply_drag,
+                    dim=1,
+                    inputs=[
+                        self.state_0.body_q,
+                        self.state_0.body_qd,
+                        self.model.body_com,
+                        self.model.body_mass,
+                        self.drag_body,
+                        self.drag_points,
+                        DRAG_STIFFNESS,
+                        DRAG_DAMPING,
+                    ],
+                    outputs=[self.state_0.body_f],
+                    device=self.device,
+                )
+            if self.model.particle_count:
+                wp.launch(
+                    air_drag,
+                    dim=self.model.particle_count,
+                    inputs=[CLOTH_AIR_DRAG, self.state_0.particle_qd, self.model.particle_mass],
+                    outputs=[self.state_0.particle_f],
+                    device=self.device,
+                )
+                wp.launch(
+                    pull_particles,
+                    dim=MAX_GRABBED_PARTICLES,
+                    inputs=[
+                        self.grabbed,
+                        self.grabbed_count,
+                        self.grabbed_offsets,
+                        self.grab_target,
+                        CLOTH_DRAG_STIFFNESS,
+                        CLOTH_DRAG_DAMPING,
+                        self.state_0.particle_q,
+                        self.state_0.particle_qd,
+                        self.model.particle_mass,
+                    ],
+                    outputs=[self.state_0.particle_f],
+                    device=self.device,
+                )
             self.pipeline.collide(self.state_0, self.contacts)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
@@ -221,9 +378,9 @@ class Simulation:
 
     def reset(self) -> None:
         with wp.ScopedDevice(self.device):
+            self.clear_drag()
             self.state_0.assign(self.initial)
             self.state_1.assign(self.initial)
-            self.drag_body.fill_(-1)
         self.sim_time = 0.0
 
     def set_drag(self, body: int, local: list[float], target: list[float]) -> None:
@@ -232,19 +389,52 @@ class Simulation:
         self.drag_points.assign(np.array([local, target], dtype=np.float32))
         self.drag_body.assign(np.array([body], dtype=np.int32))
 
+    def set_particle_drag(self, particle: int, target: list[float]) -> None:
+        """Pull the cloth around `particle` toward `target` until clear_drag()."""
+        if not 0 <= particle < self.model.particle_count:
+            return
+        if particle != self.grabbed_particle:
+            cloth = next((c for c in self.cloths if c["start"] <= particle < c["start"] + c["count"]), None)
+            if cloth is None:
+                return
+            start, end = cloth["start"], cloth["start"] + cloth["count"]
+            q = self.state_0.particle_q.numpy()
+            offsets = q[start:end] - q[particle]
+            distance = np.linalg.norm(offsets, axis=1)
+            near = np.argsort(distance)[:MAX_GRABBED_PARTICLES]
+            # Everything within the radius, but at least the grabbed point and its nearest neighbour.
+            radius = max(CLOTH_DRAG_RADIUS / self.meters_per_unit, distance[near[1]] if len(near) > 1 else 0.0)
+            near = near[distance[near] <= radius]
+            grabbed = np.zeros(MAX_GRABBED_PARTICLES, dtype=np.int32)
+            grabbed[: len(near)] = near + start
+            padded = np.zeros((MAX_GRABBED_PARTICLES, 3), dtype=np.float32)
+            padded[: len(near)] = offsets[near]
+            self.grabbed.assign(grabbed)
+            self.grabbed_offsets.assign(padded)
+            self.grabbed_count.assign(np.array([len(near)], dtype=np.int32))
+            self.grabbed_particle = particle
+        self.grab_target.assign(np.array([target], dtype=np.float32))
+
     def clear_drag(self) -> None:
         self.drag_body.fill_(-1)
+        self.grabbed_count.zero_()
+        self.grabbed_particle = -1
 
     def frame(self) -> bytes:
-        """[simTime, bodyCount, bodyCount x (px, py, pz, qx, qy, qz, qw)] as little-endian float32."""
-        poses = self.state_0.body_q.numpy().astype("<f4", copy=False).reshape(-1)
-        header = np.array([self.sim_time, len(self.bodies)], dtype="<f4")
-        return header.tobytes() + poses.tobytes()
+        """Little-endian float32: [simTime, bodyCount, particleCount,
+        bodyCount x (px, py, pz, qx, qy, qz, qw), particleCount x (x, y, z)]."""
+        empty = np.zeros(0, "<f4")
+        poses = self.state_0.body_q.numpy().astype("<f4", copy=False).reshape(-1) if self.model.body_count else empty
+        particles = self.state_0.particle_q.numpy().astype("<f4", copy=False).reshape(-1) if self.model.particle_count else empty
+        header = np.array([self.sim_time, len(self.bodies), self.model.particle_count], dtype="<f4")
+        return header.tobytes() + poses.tobytes() + particles.tobytes()
 
     def ready_message(self) -> dict:
         return {
             "type": "ready",
             "bodies": self.bodies,
+            "cloths": self.cloths,
+            "particles": int(self.model.particle_count),
             "device": str(self.device),
             "solver": self.solver_name,
             "dt": self.frame_dt,
@@ -334,6 +524,8 @@ class Connection:
             self.speed = min(8.0, max(0.05, float(msg.get("value", 1.0))))
         elif kind == "drag" and self.sim is not None:
             await self.run_sim(self.sim.set_drag, int(msg["body"]), list(msg["local"]), list(msg["target"]))
+        elif kind == "drag_particle" and self.sim is not None:
+            await self.run_sim(self.sim.set_particle_drag, int(msg["particle"]), list(msg["target"]))
         elif kind == "drag_end" and self.sim is not None:
             await self.run_sim(self.sim.clear_drag)
 
@@ -373,7 +565,10 @@ class Connection:
         root = self.workdir / Path(*upload["root"].parts)
         print(f"[newton] loading {upload['root']} ({len(upload['files'])} files) on {self.device} with {upload['solver']}")
         self.sim = await self.run_sim(Simulation, root, self.device, upload["solver"], upload["substeps"], upload["fps"])
-        print(f"[newton] ready: {len(self.sim.bodies)} bodies, {self.sim.model.joint_count} joints")
+        print(
+            f"[newton] ready: {len(self.sim.bodies)} bodies, {self.sim.model.joint_count} joints, "
+            f"{len(self.sim.cloths)} cloths ({self.sim.model.particle_count} particles)"
+        )
         await self.send_json(self.sim.ready_message())
         await self.send_frame()
 

@@ -1,4 +1,5 @@
 import {
+  DoubleSide,
   Group,
   MeshPhysicalMaterial,
   type AnimationClip,
@@ -258,6 +259,21 @@ export class ViewerComposer extends USDComposer {
       wrapper.add(target);
     }
     return wrapper;
+  }
+
+  /** three ignores `doubleSided`; open surfaces such as cloth need their back faces drawn. */
+  protected override _buildMesh(path: string, spec: USDSpec): Mesh {
+    const mesh = super._buildMesh(path, spec);
+    if (this.attributeValue(path, "doubleSided") === true) {
+      const twoSided = (material: Material) => {
+        if (material.side === DoubleSide) return material;
+        const copy = material.clone();
+        copy.side = DoubleSide;
+        return copy;
+      };
+      mesh.material = Array.isArray(mesh.material) ? mesh.material.map(twoSided) : twoSided(mesh.material);
+    }
+    return mesh;
   }
 
   /** Only merge a referenced mesh into its prim when nothing else would be lost. */

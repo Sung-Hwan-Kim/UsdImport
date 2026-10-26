@@ -10,11 +10,20 @@ export type EngineKind = "physx" | "newton";
  */
 export type PoseFrame = "world" | "stage";
 
+/** A simulated cloth mesh: one particle per USD mesh point, in point order. */
+export interface ClothBinding {
+  object: Object3D;
+  /** First particle and particle count in `readParticles()`. */
+  start: number;
+  count: number;
+}
+
 export interface EngineLoadResult {
   /** Simulated bodies, in the order poses are reported. */
   bodies: Object3D[];
   /** Kinematic bodies follow their animated pose instead of the simulation. */
   kinematic: boolean[];
+  cloths: ClothBinding[];
   frame: PoseFrame;
   /** Fixed simulation step in seconds. */
   dt: number;
@@ -48,12 +57,16 @@ export interface PhysicsEngine {
   reset(): Promise<void>;
   /** Latest poses, 7 floats per body (px, py, pz, qx, qy, qz, qw) in the load result's frame. */
   readPoses(): Float32Array | null;
+  /** Latest cloth particle positions, 3 floats each, in the load result's frame. */
+  readParticles(): Float32Array | null;
   /** Simulated time in seconds. */
   time(): number;
   setKinematicPose(index: number, position: Vector3, quaternion: Quaternion): void;
   /** `local` is the grab point in the body frame, `target` a point in the pose frame. */
   beginDrag(index: number, local: Vector3, target: Vector3): void;
   updateDrag(target: Vector3): void;
+  /** Hold a cloth particle at `target` (pose frame) until `endDrag`. */
+  dragParticle(index: number, target: Vector3): void;
   endDrag(): void;
   dispose(): void;
 }

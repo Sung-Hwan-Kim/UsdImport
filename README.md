@@ -3,6 +3,7 @@
 `.usd` · `.usda` · `.usdc` · `.usdz` 파일을 브라우저에서 보는 웹 뷰어입니다. **Next.js 16 + React Three Fiber**로 만들었습니다.
 모든 처리는 브라우저 안에서 이뤄지며, 파일은 서버로 업로드되지 않습니다(선택적인 로컬 Newton 서버를 쓸 때만 그 서버로 전송).
 UsdPhysics가 작성된 스테이지는 **PhysX**(브라우저 WASM) 또는 **NVIDIA Newton**(로컬 GPU 서버)으로 시뮬레이션을 재생할 수 있습니다.
+천(Surface Deformable)은 Newton으로 시뮬레이션합니다.
 
 ```bash
 npm install
@@ -33,19 +34,23 @@ npm run build && npm start
 `PhysicsRigidBodyAPI` · `PhysicsCollisionAPI` 등 UsdPhysics가 작성된 스테이지를 열면 아래쪽에 물리 바가 나타납니다.
 
 - **재생 · 한 프레임 진행 · 리셋 · 끄기**, 속도 조절, 콜라이더 와이어프레임 표시
-- 시뮬레이션을 시작한 뒤 **동적 바디를 마우스 왼쪽 버튼으로 끌면** 스프링으로 잡아당깁니다. 잡을 수 있는 바디 위에서는 커서가 손 모양으로 바뀌고,
+- 시뮬레이션을 시작한 뒤 **동적 바디나 천을 마우스 왼쪽 버튼으로 끌면** 스프링으로 잡아당깁니다. 잡을 수 있는 바디 위에서는 커서가 손 모양으로 바뀌고,
   일시정지 중에 끌면 재생이 이어집니다 (빈 곳·정적 물체 드래그는 카메라 회전, 클릭은 선택)
 - 인스펙터의 "물리" 섹션: 바디 종류·질량·초기 속도, 콜라이더 형상·물리 머티리얼, 조인트 종류·대상·제한·드라이브, 중력
 - 지원 범위: 리지드 바디(dynamic/kinematic), 콜라이더(Cube/Sphere/Capsule 기본 형상, 볼록 껍질, 정적 삼각형 메시),
   물리 머티리얼(마찰·반발·밀도), MassAPI, 초기 선·각속도, 조인트(revolute · prismatic · spherical · fixed · distance · 일반 D6)와
   LimitAPI · DriveAPI, PhysicsScene 중력, `upAxis` · `metersPerUnit` 변환
+- **천 (Newton 전용)**: AOUSD Deformable 제안 스키마 — `PhysicsSurfaceDeformableSimAPI`를 적용한 Mesh(점 하나가 파티클 하나),
+  `PhysicsSurfaceDeformableMaterialAPI`(밀도 · 영률 · 푸아송 비), `physics:thicknesses`, 정적 대상에 붙인 `PhysicsAttachment`(고정점).
+  리지드 바디와 서로 충돌하며, PhysX를 고르면 천은 움직이지 않는 채로 남습니다
 
 | 엔진 | 실행 위치 | 준비 |
 |---|---|---|
 | **PhysX 5.11** (`physx-js-webidl`) | 브라우저 WASM, CPU | 없음 (`npm install` 시 wasm이 `public/physx/`로 복사됨) |
 | **Newton 1.7** (NVIDIA Warp) | 로컬 Python 서버, GPU | `npm run newton:setup` 후 `npm run newton` — [server/newton/README.md](server/newton/README.md) |
 
-엔진은 물리 바 왼쪽의 메뉴에서 바꿉니다. 물리 샘플: **Physics Playground**(USDA), **Physics Joints**(USDC), **Dominoes (Z-up, cm)**(USD).
+엔진은 물리 바 왼쪽의 메뉴에서 바꿉니다. 물리 샘플: **Physics Playground**(USDA), **Physics Joints**(USDC), **Dominoes (Z-up, cm)**(USD),
+**Physics Cloth**(USDA, Newton — 식탁보 · 봉에 고정된 커튼 · 공).
 
 ## 지원 기능
 
@@ -95,3 +100,5 @@ scripts/generate_samples.py   public/samples 생성 스크립트 (`pip install u
 - 큰 파일은 메인 스레드에서 파싱하므로 로딩 중 UI가 잠깐 멈출 수 있습니다
 - 물리: 아티큘레이션(ArticulationRootAPI)은 일반 조인트로 시뮬레이션합니다. convexDecomposition은 PhysX에서 단일 볼록 껍질로 근사하며,
   동적 바디의 삼각형 메시 콜라이더도 볼록 껍질로 대체합니다. 충돌 그룹 · FilteredPairsAPI는 아직 반영하지 않습니다
+- Deformable: 천만 지원합니다(Newton). 볼륨(TetMesh) · 커브 Deformable, 리지드 바디에 붙인 천 Attachment, 예전 Omniverse의
+  `PhysxDeformableBodyAPI` · `PhysxParticleClothAPI`는 지원하지 않습니다

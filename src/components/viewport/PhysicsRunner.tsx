@@ -3,10 +3,11 @@
 import { useFrame, useThree } from "@react-three/fiber";
 import { useEffect, useRef } from "react";
 import { Matrix4, Plane, Quaternion, Raycaster, Vector2, Vector3, type Object3D } from "three";
+import { createClothState, nearestClothPoint, restoreCloth, updateCloth, type ClothState } from "@/lib/physics/cloth";
 import type { EngineKind, EngineLoadResult, PhysicsEngine } from "@/lib/physics/engine";
 import { NewtonEngine } from "@/lib/physics/newton/newtonEngine";
 import { PhysXEngine } from "@/lib/physics/physx/physxEngine";
-import { extractPhysics } from "@/lib/physics/schema";
+import { authoredAttribute, extractPhysics } from "@/lib/physics/schema";
 import { isShownInHierarchy } from "@/lib/scene";
 import { useViewer, type PhysicsCommand } from "@/lib/store";
 import type { LoadedStage } from "@/lib/usd/loadStage";
@@ -24,6 +25,8 @@ interface Session {
   /** Body indices, parents before children. */
   order: number[];
   bodyIndex: Map<Object3D, number>;
+  cloths: ClothState[];
+  clothByObject: Map<Object3D, ClothState>;
   accumulator: number;
 }
 
@@ -75,6 +78,8 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
   };
 
   const applyPoses = (s: Session) => {
+    const particles = s.cloths.length ? s.engine.readParticles() : null;
+    if (particles) for (const cloth of s.cloths) updateCloth(cloth, particles);
     const poses = s.engine.readPoses();
     if (!poses) return;
     stage.scene.updateMatrixWorld();
@@ -101,6 +106,7 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
   };
 
   const restore = (s: Session) => {
+    for (const cloth of s.cloths) restoreCloth(cloth);
     s.result.bodies.forEach((obj, i) => {
       const t = s.snapshot[i];
       obj.position.copy(t.position);
@@ -126,7 +132,12 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
       try {
         stage.scene.updateMatrixWorld(true);
         const description = extractPhysics(stage);
-        if (!description.bodies.length) throw new Error("시뮬레이션할 리지드 바디(PhysicsRigidBodyAPI)가 없습니다.");
+        const hasCloth = description.deformables.some((d) => d.kind === "surface");
+        if (!description.bodies.length && !(hasCloth && settings.physicsEngine === "newton")) {
+          throw new Error(
+            hasCloth ? "천만 있는 스테이지는 Newton 엔진에서 재생할 수 있습니다." : "시뮬레이션할 리지드 바디(PhysicsRigidBodyAPI)가 없습니다.",
+          );
+        }
         const engine = createEngine(settings.physicsEngine);
         const result = await engine.load(stage, description);
         if (disposed.current) {
@@ -140,8 +151,21 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
           scales: [],
           order: result.bodies.map((_, i) => i).sort((a, b) => depthOf(result.bodies[a]) - depthOf(result.bodies[b])),
           bodyIndex: new Map(result.bodies.map((o, i) => [o, i])),
+          cloths: [],
+          clothByObject: new Map(),
           accumulator: 0,
         };
+        const frameToWorld = result.frame === "stage" ? stage.scene.matrixWorld : new Matrix4();
+        for (const binding of result.cloths) {
+          const points = authoredAttribute(stage, binding.object, "points") as ArrayLike<number> | undefined;
+          const cloth = points ? createClothState(binding, points, frameToWorld) : "USD 점(points)이 없습니다";
+          if (typeof cloth === "string") {
+            result.warnings.push(`${binding.object.name}: 천을 표시할 수 없습니다 — ${cloth}.`);
+            continue;
+          }
+          s.cloths.push(cloth);
+          s.clothByObject.set(cloth.mesh, cloth);
+        }
         s.scales = result.bodies.map((o) => {
           frameMatrix(s, o, tmpMatrix).decompose(tmpPosition, tmpQuaternion, tmpScale);
           return tmpScale.clone();
@@ -245,9 +269,10 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
   }, []);
 
   // Mouse grab: once a simulation is loaded, a left-drag that starts on a dynamic
-  // body pulls it with a spring toward a point on a camera-facing plane (a paused
-  // simulation resumes). Listeners sit in the capture phase on the element camera
-  // controls and R3F listen on, so neither sees a press that lands on a body.
+  // body pulls it with a spring toward a point on a camera-facing plane, and one
+  // on a cloth holds its nearest particle at that point (a paused simulation
+  // resumes). Listeners sit in the capture phase on the element camera controls
+  // and R3F listen on, so neither sees a press that lands on a body or cloth.
   useEffect(() => {
     const { gl, events } = get();
     const canvas = gl.domElement;
@@ -261,11 +286,12 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
       pointerId: number;
       x: number;
       y: number;
-      index: number;
       object: Object3D;
-      local: Vector3;
-      target: Vector3;
       grabbing: boolean;
+      /** A rigid body: grab point in its frame, start target in the pose frame. */
+      body?: { index: number; local: Vector3; target: Vector3 };
+      /** A cloth particle: its offset from the point under the pointer (pose frame). */
+      particle?: { index: number; offset: Vector3; start: Vector3 };
     } | null = null;
     let swallowClick = false;
     let hover: PointerEvent | null = null;
@@ -282,7 +308,7 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
     };
     const toFrame = (s: Session, world: Vector3) =>
       s.result.frame === "stage" ? world.clone().applyMatrix4(tmpInverse.copy(stage.scene.matrixWorld).invert()) : world.clone();
-    /** The dynamic body under the pointer, if a simulation is loaded. */
+    /** The dynamic body or simulated cloth under the pointer, if a simulation is loaded. */
     const pick = (e: PointerEvent) => {
       const s = session.current;
       const status = useViewer.getState().physics.status;
@@ -290,23 +316,36 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
       castRay(e);
       const hit = raycaster.intersectObject(stage.scene, true).find((h) => isShownInHierarchy(h.object));
       if (!hit) return null;
+      const cloth = s.clothByObject.get(hit.object);
+      if (cloth) return hit.face ? { s, hit, cloth } : null;
       let index = -1;
       for (let cur: Object3D | null = hit.object; cur && index < 0; cur = cur.parent) index = s.bodyIndex.get(cur) ?? -1;
       if (index < 0 || s.result.kinematic[index]) return null;
-      return { s, index, hit };
+      return { s, hit, body: index };
     };
 
     const onDown = (e: PointerEvent) => {
       if (e.button !== 0 || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
       const picked = pick(e);
       if (!picked) return;
-      const { s, index, hit } = picked;
+      const { s, hit } = picked;
 
       e.stopImmediatePropagation();
       e.preventDefault();
-      frameMatrix(s, s.result.bodies[index], tmpMatrix).decompose(tmpPosition, tmpQuaternion, tmpScale);
       const grabPoint = toFrame(s, hit.point);
-      const local = grabPoint.clone().sub(tmpPosition).applyQuaternion(tmpQuaternion.invert());
+      let body: NonNullable<typeof press>["body"];
+      let particle: NonNullable<typeof press>["particle"];
+      if (picked.cloth) {
+        const index = picked.cloth.binding.start + nearestClothPoint(picked.cloth, hit.face!, hit.point);
+        const particles = s.engine.readParticles();
+        const start = particles ? new Vector3().fromArray(particles, index * 3) : grabPoint.clone();
+        particle = { index, start, offset: start.clone().sub(grabPoint) };
+      } else {
+        const index = picked.body!;
+        frameMatrix(s, s.result.bodies[index], tmpMatrix).decompose(tmpPosition, tmpQuaternion, tmpScale);
+        const local = grabPoint.clone().sub(tmpPosition).applyQuaternion(tmpQuaternion.invert());
+        body = { index, local, target: grabPoint };
+      }
       plane.setFromNormalAndCoplanarPoint(get().camera.getWorldDirection(new Vector3()).negate(), hit.point);
       setControls(false);
       try {
@@ -314,7 +353,7 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
       } catch {
         // Not an active pointer (e.g. synthetic events); moves still arrive while over the canvas.
       }
-      press = { pointerId: e.pointerId, x: e.clientX, y: e.clientY, index, object: hit.object, local, target: grabPoint, grabbing: false };
+      press = { pointerId: e.pointerId, x: e.clientX, y: e.clientY, object: hit.object, grabbing: false, body, particle };
     };
     const onMove = (e: PointerEvent) => {
       const s = session.current;
@@ -322,14 +361,17 @@ export default function PhysicsRunner({ stage }: { stage: LoadedStage }) {
       if (!press.grabbing) {
         if (Math.hypot(e.clientX - press.x, e.clientY - press.y) < GRAB_THRESHOLD) return;
         press.grabbing = true;
-        s.engine.beginDrag(press.index, press.local, press.target);
+        if (press.body) s.engine.beginDrag(press.body.index, press.body.local, press.body.target);
+        if (press.particle) s.engine.dragParticle(press.particle.index, press.particle.start);
         canvas.style.cursor = "grabbing";
         const { physics, physicsCommand } = useViewer.getState();
         if (physics.status === "paused") physicsCommand("play");
       }
       castRay(e);
       const point = raycaster.ray.intersectPlane(plane, new Vector3());
-      if (point) s.engine.updateDrag(toFrame(s, point));
+      if (!point) return;
+      if (press.particle) s.engine.dragParticle(press.particle.index, toFrame(s, point).add(press.particle.offset));
+      else s.engine.updateDrag(toFrame(s, point));
     };
     const onUp = () => {
       if (!press) return;
