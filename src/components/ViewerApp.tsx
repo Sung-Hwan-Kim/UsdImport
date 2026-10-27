@@ -10,7 +10,7 @@ import { useViewer } from "@/lib/store";
 import AnimationBar from "./AnimationBar";
 import HierarchyPanel from "./HierarchyPanel";
 import InspectorPanel from "./InspectorPanel";
-import { DropOverlay, EmptyState, ErrorToast, LoadingOverlay, RenderStatsOverlay } from "./Overlays";
+import { DropOverlay, EmptyState, ErrorToast, LoadingOverlay, MissingLayersNotice, RenderStatsOverlay } from "./Overlays";
 import PhysicsBar from "./PhysicsBar";
 import SaveDialog from "./SaveDialog";
 import ScriptEditor from "./ScriptEditor";
@@ -189,6 +189,7 @@ export default function ViewerApp() {
             {stage && hasAnimation && <AnimationBar />}
             {stage?.metadata.hasPhysics && <PhysicsBar raised={hasAnimation} />}
             {showStats && stage && <RenderStatsOverlay />}
+            {!loading && <MissingLayersNotice />}
             {loading && <LoadingOverlay />}
             <ErrorToast />
           </main>

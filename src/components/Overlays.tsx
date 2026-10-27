@@ -1,11 +1,13 @@
 "use client";
 
 import { AlertTriangle, FileUp, FolderOpen, Upload, X } from "lucide-react";
+import { useState } from "react";
 import { pickLocalFiles } from "@/lib/files";
 import { formatCount, formatNumber } from "@/lib/format";
 import { useRenderInfo } from "@/lib/renderInfo";
 import { SAMPLES, sampleUrl } from "@/lib/samples";
 import { useViewer } from "@/lib/store";
+import { isLayerFile } from "@/lib/usd/paths";
 import Logo from "./Logo";
 import { Badge, Button } from "./ui";
 
@@ -89,6 +91,44 @@ export function ErrorToast() {
         <div className="mt-0.5 text-[12px] break-words text-muted">{error}</div>
       </div>
       <button type="button" onClick={clearError} className="text-faint hover:text-fg" aria-label="닫기">
+        <X className="size-4" />
+      </button>
+    </div>
+  );
+}
+
+/**
+ * A root opened on its own cannot reach the layers it references: browsers
+ * only hand over the files that were picked. Say so where it shows, since the
+ * stage then draws little or nothing.
+ */
+export function MissingLayersNotice() {
+  const stage = useViewer((s) => s.stage);
+  const openFiles = useViewer((s) => s.openFiles);
+  const [dismissed, setDismissed] = useState<number | null>(null);
+  // Shallow paths first: a root's own references before deeper (often variant) payloads.
+  const layers = (stage?.missing.filter(isLayerFile) ?? []).sort((a, b) => a.split("/").length - b.split("/").length);
+  if (!stage || !layers.length || dismissed === stage.id) return null;
+  return (
+    <div
+      role="status"
+      className="absolute top-16 left-3 z-10 flex max-w-[min(440px,calc(100%-24px))] animate-fade-in items-start gap-2.5 rounded-lg border border-warn/40 bg-panel/95 px-3.5 py-3 shadow-2xl backdrop-blur"
+    >
+      <AlertTriangle className="mt-0.5 size-4 shrink-0 text-warn" />
+      <div className="min-w-0 flex-1">
+        <div className="text-[13px] font-medium text-fg">참조한 레이어 {layers.length}개를 찾지 못했습니다</div>
+        <div className="mt-0.5 truncate font-mono text-[11.5px] text-muted" title={layers.join("\n")}>
+          {layers[0]}
+          {layers.length > 1 && <span className="font-sans"> 외 {layers.length - 1}개</span>}
+        </div>
+        <p className="mt-1.5 text-[12px] leading-relaxed text-muted">
+          브라우저는 직접 고른 파일만 읽을 수 있습니다. 이 파일이 들어 있는 폴더를 열거나 폴더째 끌어다 놓으세요.
+        </p>
+        <Button icon={FolderOpen} className="mt-2.5" onClick={() => pickLocalFiles(true).then(openFiles)}>
+          폴더 열기
+        </Button>
+      </div>
+      <button type="button" onClick={() => setDismissed(stage.id)} className="text-faint hover:text-fg" aria-label="닫기">
         <X className="size-4" />
       </button>
     </div>
