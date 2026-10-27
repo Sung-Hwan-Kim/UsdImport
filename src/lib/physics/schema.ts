@@ -72,6 +72,12 @@ export interface BodyInfo {
   object: Object3D;
   path: string;
   kind: BodyKind;
+  /**
+   * A dynamic body held to the world (or a static collider) by unbreakable
+   * fixed joints, directly or through other such bodies, so it never moves:
+   * the fixed base of an articulated robot, which Isaac Sim solves exactly.
+   */
+  welded?: boolean;
   /** World pose of the body frame at load time. */
   pose: Pose;
   /** Explicit mass (kg). */
@@ -80,6 +86,8 @@ export interface BodyInfo {
   density?: number;
   /** Centre of mass in the body frame (m). */
   centerOfMass?: Vector3;
+  /** Authored inertia (kg·m²) about principal axes given in the body frame; computed from the colliders otherwise. */
+  inertia?: { diagonal: Vector3; principalAxes: Quaternion };
   /** World-space m/s and rad/s. */
   linearVelocity: Vector3;
   angularVelocity: Vector3;
@@ -163,6 +171,10 @@ export interface JointInfo {
   /** "angular"/"linear" for revolute/prismatic, DOF names for generic joints. */
   drives: Partial<Record<"angular" | "linear" | Dof, JointDrive>>;
   collisionEnabled: boolean;
+  /** physics:excludeFromArticulation: a maximal joint even between articulation links (e.g. closing a loop). */
+  excludeFromArticulation: boolean;
+  /** PhysxJointAPI, for articulation joints: friction coefficient, armature, max velocity (rad/s or m/s). */
+  physx: { friction: number; armature: number; maxVelocity?: number };
   breakForce: number;
   breakTorque: number;
   /** Soft limits (physxLimit:<axis>:stiffness/damping), per radian or metre. */
@@ -181,6 +193,22 @@ export interface DeformableInfo {
   material: { path: string | null; density?: number; youngsModulus?: number; poissonsRatio?: number };
 }
 
+/** An ArticulationRootAPI prim and the bodies it articulates. */
+export interface ArticulationInfo {
+  path: string;
+  /** Bodies under the root prim, and those jointed to them (joints not excluded from articulations). */
+  bodies: BodyInfo[];
+  /**
+   * newton:selfCollisionEnabled, which Isaac Sim 6 reads in place of the deprecated
+   * physxArticulation:enabledSelfCollisions (both default to true). When false,
+   * links of the articulation never collide with each other.
+   */
+  selfCollision: boolean;
+  /** physxArticulation:solverPosition/VelocityIterationCount, PhysxSchema defaults 32 and 1. */
+  positionIterations: number;
+  velocityIterations: number;
+}
+
 export interface PhysicsDescription {
   /** m/s² in world space */
   gravity: Vector3;
@@ -194,6 +222,7 @@ export interface PhysicsDescription {
   physxScene: PhysxSceneSettings;
   /** FilteredPairsAPI: no collider of one side collides with any of the other. */
   filteredPairs: [ColliderInfo[], ColliderInfo[]][];
+  articulations: ArticulationInfo[];
   warnings: string[];
   /** Lookup for the inspector. */
   byObject: Map<Object3D, { body?: BodyInfo; collider?: ColliderInfo; joint?: JointInfo; deformable?: DeformableInfo }>;
@@ -312,6 +341,12 @@ class SpecReader {
 }
 
 // ---------------------------------------------------------------- helpers
+
+/** `obj` is `ancestor` or below it. */
+function isUnderObject(obj: Object3D, ancestor: Object3D): boolean {
+  for (let cur: Object3D | null = obj; cur; cur = cur.parent) if (cur === ancestor) return true;
+  return false;
+}
 
 /** A sampled value at `time`, interpolated linearly and held past the first and last samples, as USD does. */
 export function sampleScalar({ times, values }: ScalarSamples, time: number): number {
@@ -493,6 +528,15 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
       if (density > 0) body.density = density / unitScale ** 3;
       const com = reader.vec3(obj, "physics:centerOfMass");
       if (com && com.lengthSq() < 1e30) body.centerOfMass = com.multiply(pose.scale);
+      // (0, 0, 0) is the fallback: compute the inertia from the colliders.
+      const diagonal = reader.vec3(obj, "physics:diagonalInertia");
+      if (diagonal && diagonal.x > 0 && diagonal.y > 0 && diagonal.z > 0) {
+        const s = Math.cbrt(Math.abs(pose.scale.x * pose.scale.y * pose.scale.z)) || 1;
+        // The fallback (0, 0, 0, 0) means unauthored: the body frame's axes.
+        const axes = reader.quat(obj, "physics:principalAxes");
+        const principalAxes = axes && axes.lengthSq() > 1e-12 ? axes.normalize() : new Quaternion();
+        body.inertia = { diagonal: diagonal.multiplyScalar(s * s), principalAxes };
+      }
     }
     bodies.push(body);
     bodyByObject.set(obj, body);
@@ -793,6 +837,12 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
       axis,
       drives: {},
       collisionEnabled: reader.bool(obj, "physics:collisionEnabled", false),
+      excludeFromArticulation: reader.bool(obj, "physics:excludeFromArticulation", false),
+      physx: {
+        friction: reader.num(obj, "physxJoint:jointFriction", 0),
+        armature: reader.num(obj, "physxJoint:armature", 0),
+        maxVelocity: authoredNumber(obj, "physxJoint:maxJointVelocity", type === "prismatic" ? unitScale : MathUtils.DEG2RAD),
+      },
       breakForce: reader.num(obj, "physics:breakForce", Number.POSITIVE_INFINITY) * unitScale,
       breakTorque: reader.num(obj, "physics:breakTorque", Number.POSITIVE_INFINITY) * unitScale ** 2,
       limitSprings: {},
@@ -861,6 +911,45 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
     entry(obj).joint = joint;
   });
 
+  // ---- bodies welded to the world
+  const welds = joints.filter((j) => j.type === "fixed" && !Number.isFinite(j.breakForce) && !Number.isFinite(j.breakTorque));
+  for (let grown = true; grown; ) {
+    grown = false;
+    for (const j of welds) {
+      const held0 = !j.body0 || j.body0.welded;
+      const held1 = !j.body1 || j.body1.welded;
+      for (const [body, held] of [[j.body1, held0], [j.body0, held1]] as const) {
+        if (!body || body.welded || !held || body.kind !== "dynamic") continue;
+        body.welded = true;
+        grown = true;
+      }
+    }
+  }
+
+  // ---- articulations
+  const articulations: ArticulationInfo[] = [];
+  const articulated = joints.filter((j) => j.body0 && j.body1 && !j.excludeFromArticulation);
+  root.traverse((obj) => {
+    if (obj === root || !reader.hasApi(obj, "PhysicsArticulationRootAPI")) return;
+    const members = new Set(bodies.filter((b) => isUnderObject(b.object, obj)));
+    for (let grown = true; grown; ) {
+      grown = false;
+      for (const j of articulated) {
+        if (members.has(j.body0!) === members.has(j.body1!)) continue;
+        members.add(j.body0!).add(j.body1!);
+        grown = true;
+      }
+    }
+    const selfCollision = reader.bool(obj, "newton:selfCollisionEnabled", reader.bool(obj, "physxArticulation:enabledSelfCollisions", true));
+    articulations.push({
+      path: stagePathOf(obj),
+      bodies: [...members],
+      selfCollision,
+      positionIterations: reader.num(obj, "physxArticulation:solverPositionIterationCount", 32),
+      velocityIterations: reader.num(obj, "physxArticulation:solverVelocityIterationCount", 1),
+    });
+  });
+
   // ---- scene
   let gravity = new Vector3(0, -9.81, 0);
   let stepsPerSecond: number | undefined;
@@ -882,7 +971,7 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
     physxScene.velocityIterations = [reader.num(obj, "physxScene:minVelocityIterationCount", 0), reader.num(obj, "physxScene:maxVelocityIterationCount", 255)];
   });
 
-  return { gravity, stepsPerSecond, bodies, staticColliders, joints, deformables, collisionGroups, physxScene, filteredPairs, warnings, byObject };
+  return { gravity, stepsPerSecond, bodies, staticColliders, joints, deformables, collisionGroups, physxScene, filteredPairs, articulations, warnings, byObject };
 }
 
 /**
@@ -892,7 +981,10 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
  */
 export function collisionFilter(d: PhysicsDescription): ((a: ColliderInfo, b: ColliderInfo) => boolean) | null {
   const groups = d.collisionGroups;
-  if (!groups.some((g) => g.filtered.length || g.invert) && !d.filteredPairs.length) return null;
+  const noSelfCollision = d.articulations.filter((a) => !a.selfCollision);
+  if (!groups.some((g) => g.filtered.length || g.invert) && !d.filteredPairs.length && !noSelfCollision.length) return null;
+  const articulationOf = new Map<BodyInfo, ArticulationInfo>();
+  for (const a of noSelfCollision) for (const b of a.bodies) articulationOf.set(b, a);
   const pairs = new Map<ColliderInfo, Set<ColliderInfo>>();
   const add = (a: ColliderInfo, b: ColliderInfo) => {
     let set = pairs.get(a);
@@ -910,6 +1002,7 @@ export function collisionFilter(d: PhysicsDescription): ((a: ColliderInfo, b: Co
   const blocks = (g: CollisionGroupInfo, others: number[]) => others.some((h) => g.filtered.includes(h)) !== g.invert;
   return (a, b) => {
     if (pairs.get(a)?.has(b)) return false;
+    if (a.body && b.body && articulationOf.has(a.body) && articulationOf.get(a.body) === articulationOf.get(b.body)) return false;
     return !a.groups.some((g) => blocks(groups[g], b.groups)) && !b.groups.some((g) => blocks(groups[g], a.groups));
   };
 }

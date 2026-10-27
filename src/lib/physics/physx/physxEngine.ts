@@ -7,6 +7,7 @@ import {
   driveTargetsAt,
   hasAnimatedDrives,
   relativePose,
+  type ArticulationInfo,
   type BodyInfo,
   type ColliderInfo,
   type Dof,
@@ -45,6 +46,43 @@ interface Releasable {
 
 function finite(v: number | undefined): v is number {
   return v !== undefined && Number.isFinite(v);
+}
+
+/** An iteration count within the scene's bounds. */
+function clampCount(n: number, [lo, hi]: [number, number]): number {
+  return Math.min(Math.max(Math.round(n), lo), hi);
+}
+
+function unbreakable(j: JointInfo): boolean {
+  return !finite(j.breakForce) && !finite(j.breakTorque);
+}
+
+/**
+ * Whether a PhysX articulation joint can stand for a UsdPhysics joint:
+ * fixed, revolute, prismatic, spherical, or a generic joint whose free DOFs
+ * are all rotations or a single translation. Breakable joints stay maximal.
+ */
+function articulationJointKind(j: JointInfo): "fixed" | "revolute" | "prismatic" | "spherical" | null {
+  if (!unbreakable(j)) return null;
+  if (j.type === "fixed" || j.type === "revolute" || j.type === "prismatic" || j.type === "spherical") return j.type;
+  if (j.type !== "generic") return null;
+  const free = (dof: Dof) => {
+    const lim = j.dofLimits?.[dof];
+    return !lim || lim.low <= lim.high;
+  };
+  const trans = (["transX", "transY", "transZ"] as const).filter(free);
+  const rot = (["rotX", "rotY", "rotZ"] as const).filter(free);
+  if (!trans.length) return rot.length ? "spherical" : "fixed";
+  return trans.length === 1 && !rot.length ? "prismatic" : null;
+}
+
+/** An articulation joint built from a UsdPhysics joint; `sign` is -1 when body1 is the parent link. */
+interface ArticulatedJoint {
+  joint: PhysX.PxArticulationJointReducedCoordinate;
+  info: JointInfo;
+  sign: number;
+  /** Drive name (JointInfo.drives key) -> articulation axis. */
+  axes: [keyof JointInfo["drives"], number][];
 }
 
 /** Smallest feature size of a shape, used to scale contact offsets for tiny objects. */
@@ -133,7 +171,12 @@ export class PhysXEngine implements PhysicsEngine {
   private px!: Px;
   private description!: PhysicsDescription;
   private scene: PhysX.PxScene | null = null;
-  private actors: PhysX.PxRigidDynamic[] = [];
+  private actors: PhysX.PxRigidBody[] = [];
+  /** Bodies posed from the stage: kinematic ones, and welded ones outside an articulation. */
+  private held: boolean[] = [];
+  private articulations: PhysX.PxArticulationReducedCoordinate[] = [];
+  private links = new Set<PhysX.PxRigidBody>();
+  private articulatedJoints: ArticulatedJoint[] = [];
   private statics: PhysX.PxRigidStatic[] = [];
   private staticByCollider = new Map<ColliderInfo, PhysX.PxRigidStatic>();
   /** Collider ids carried in each shape's filter data (word3) for the filter shader. */
@@ -160,7 +203,7 @@ export class PhysXEngine implements PhysicsEngine {
     if (cloths) this.warnings.push(`천 ${cloths}개는 Newton 엔진에서만 시뮬레이션되며 PhysX에서는 움직이지 않습니다.`);
     return {
       bodies: description.bodies.map((b) => b.object),
-      kinematic: description.bodies.map((b) => b.kind === "kinematic"),
+      kinematic: this.held,
       cloths: [],
       frame: "world",
       dt: this.dt,
@@ -206,8 +249,11 @@ export class PhysXEngine implements PhysicsEngine {
       this.staticByCollider.set(collider, actor);
     }
 
-    this.actors = d.bodies.map((body) => this.createBody(body));
+    const { links, joints: articulated } = this.buildArticulations();
+    this.held = d.bodies.map((b) => b.kind === "kinematic" || (!!b.welded && !links.has(b)));
+    this.actors = d.bodies.map((body) => links.get(body) ?? this.createBody(body, this.held[body.index]));
     for (const joint of d.joints) {
+      if (articulated.has(joint)) continue;
       try {
         this.createJoint(joint);
       } catch (e) {
@@ -311,11 +357,38 @@ export class PhysXEngine implements PhysicsEngine {
     shape.release();
   }
 
-  private createBody(body: BodyInfo): PhysX.PxRigidDynamic {
+  private createBody(body: BodyInfo, held: boolean): PhysX.PxRigidDynamic {
     const { px, rt } = this;
     const pose = pxTransform(px, body.pose.position, body.pose.quaternion);
     const actor = rt.physics.createRigidDynamic(pose);
     px.destroy(pose);
+    this.setUpBody(actor, body);
+    if (held) {
+      actor.setRigidBodyFlag(px.PxRigidBodyFlagEnum.eKINEMATIC, true);
+    } else {
+      const v = pxVec3(px, body.linearVelocity);
+      const w = pxVec3(px, body.angularVelocity);
+      actor.setLinearVelocity(v);
+      actor.setAngularVelocity(w);
+      px.destroy(v);
+      px.destroy(w);
+      const settings = this.description.physxScene;
+      const p = body.physx;
+      actor.setSolverIterationCounts(
+        clampCount(p.positionIterations ?? DEFAULT_POSITION_ITERATIONS, settings.positionIterations),
+        clampCount(p.velocityIterations ?? DEFAULT_VELOCITY_ITERATIONS, settings.velocityIterations),
+      );
+      if (p.sleepThreshold !== undefined) actor.setSleepThreshold(p.sleepThreshold);
+      if (p.stabilizationThreshold !== undefined) actor.setStabilizationThreshold(p.stabilizationThreshold);
+      this.applyDynamics(actor, body);
+    }
+    this.scene!.addActor(actor);
+    return actor;
+  }
+
+  /** Shapes and mass, for an actor or an articulation link. */
+  private setUpBody(actor: PhysX.PxRigidBody, body: BodyInfo): void {
+    const { px } = this;
     for (const c of body.colliders) this.attachShape(actor, c, false);
 
     const ext = rigidBodyExt(px);
@@ -333,35 +406,235 @@ export class PhysXEngine implements PhysicsEngine {
       ext.updateMassAndInertia(actor, density, com);
     }
     if (com) px.destroy(com);
-
-    if (body.kind === "kinematic") {
-      actor.setRigidBodyFlag(px.PxRigidBodyFlagEnum.eKINEMATIC, true);
-    } else {
-      const v = pxVec3(px, body.linearVelocity);
-      const w = pxVec3(px, body.angularVelocity);
-      actor.setLinearVelocity(v);
-      actor.setAngularVelocity(w);
-      px.destroy(v);
-      px.destroy(w);
-      const settings = this.description.physxScene;
-      const p = body.physx;
-      const clamp = (n: number, [lo, hi]: [number, number]) => Math.min(Math.max(Math.round(n), lo), hi);
-      actor.setSolverIterationCounts(
-        clamp(p.positionIterations ?? DEFAULT_POSITION_ITERATIONS, settings.positionIterations),
-        clamp(p.velocityIterations ?? DEFAULT_VELOCITY_ITERATIONS, settings.velocityIterations),
-      );
-      if (p.linearDamping !== undefined) actor.setLinearDamping(p.linearDamping);
-      if (p.angularDamping !== undefined) actor.setAngularDamping(p.angularDamping);
-      if (p.maxLinearVelocity !== undefined) actor.setMaxLinearVelocity(p.maxLinearVelocity);
-      if (p.maxAngularVelocity !== undefined) actor.setMaxAngularVelocity(p.maxAngularVelocity);
-      if (p.maxDepenetrationVelocity !== undefined) actor.setMaxDepenetrationVelocity(p.maxDepenetrationVelocity);
-      if (p.sleepThreshold !== undefined) actor.setSleepThreshold(p.sleepThreshold);
-      if (p.stabilizationThreshold !== undefined) actor.setStabilizationThreshold(p.stabilizationThreshold);
-      if (p.ccd && settings.ccd) actor.setRigidBodyFlag(px.PxRigidBodyFlagEnum.eENABLE_CCD, true);
-      if (p.speculativeCcd) actor.setRigidBodyFlag(px.PxRigidBodyFlagEnum.eENABLE_SPECULATIVE_CCD, true);
+    // An authored inertia replaces the one PhysX derived from the shapes (Isaac Sim uses it as authored).
+    if (body.inertia && body.mass) {
+      // Keep the centre of mass PhysX derived from the shapes when none is authored.
+      const derived = actor.getCMassLocalPose().p;
+      const center = body.centerOfMass ?? new Vector3(derived.x, derived.y, derived.z);
+      const frame = pxTransform(px, center, body.inertia.principalAxes);
+      actor.setCMassLocalPose(frame);
+      px.destroy(frame);
+      const diagonal = pxVec3(px, body.inertia.diagonal);
+      actor.setMassSpaceInertiaTensor(diagonal);
+      px.destroy(diagonal);
     }
-    this.scene!.addActor(actor);
-    return actor;
+  }
+
+  /** PhysxRigidBodyAPI settings of a simulated body. */
+  private applyDynamics(actor: PhysX.PxRigidBody, body: BodyInfo): void {
+    const { px } = this;
+    const p = body.physx;
+    if (p.linearDamping !== undefined) actor.setLinearDamping(p.linearDamping);
+    if (p.angularDamping !== undefined) actor.setAngularDamping(p.angularDamping);
+    if (p.maxLinearVelocity !== undefined) actor.setMaxLinearVelocity(p.maxLinearVelocity);
+    if (p.maxAngularVelocity !== undefined) actor.setMaxAngularVelocity(p.maxAngularVelocity);
+    if (p.maxDepenetrationVelocity !== undefined) actor.setMaxDepenetrationVelocity(p.maxDepenetrationVelocity);
+    if (p.ccd && this.description.physxScene.ccd) actor.setRigidBodyFlag(px.PxRigidBodyFlagEnum.eENABLE_CCD, true);
+    if (p.speculativeCcd) actor.setRigidBodyFlag(px.PxRigidBodyFlagEnum.eENABLE_SPECULATIVE_CCD, true);
+  }
+
+  // ---------------------------------------------------------------- articulations
+
+  /**
+   * Bodies under an ArticulationRootAPI become a PhysX articulation, solved in
+   * reduced coordinates as Isaac Sim does; as maximal joints a long robot arm
+   * sags under gravity because its drives never converge. A member held by an
+   * unbreakable fixed joint to the world (or a welded body) is a fixed base.
+   * Joints an articulation cannot express, and those closing loops, stay
+   * maximal joints between the links.
+   */
+  private buildArticulations(): { links: Map<BodyInfo, PhysX.PxArticulationLink>; joints: Set<JointInfo> } {
+    const links = new Map<BodyInfo, PhysX.PxArticulationLink>();
+    const used = new Set<JointInfo>();
+    for (const info of this.description.articulations) {
+      try {
+        this.buildArticulation(info, links, used);
+      } catch (e) {
+        this.warnings.push(`${info.path}: 아티큘레이션 생성 실패, 일반 조인트로 시뮬레이션합니다 (${e instanceof Error ? e.message : String(e)})`);
+      }
+    }
+    return { links, joints: used };
+  }
+
+  private buildArticulation(info: ArticulationInfo, links: Map<BodyInfo, PhysX.PxArticulationLink>, used: Set<JointInfo>): void {
+    const { px, rt } = this;
+    const d = this.description;
+    const members = new Set(info.bodies.filter((b) => b.kind === "dynamic" && !links.has(b)));
+    if (!members.size) return;
+    const still = (b: BodyInfo | null) => !b || (!members.has(b) && !!b.welded);
+    const anchor = d.joints.find(
+      (j) => j.type === "fixed" && unbreakable(j) && ((j.body1 && members.has(j.body1) && still(j.body0)) || (j.body0 && members.has(j.body0) && still(j.body1))),
+    );
+    const root = anchor ? (anchor.body1 && members.has(anchor.body1) ? anchor.body1 : anchor.body0!) : [...members][0];
+    const edges = d.joints.filter(
+      (j) => j.body0 && j.body1 && j.body0 !== j.body1 && members.has(j.body0) && members.has(j.body1) && !j.excludeFromArticulation && articulationJointKind(j),
+    );
+
+    const art = rt.physics.createArticulationReducedCoordinate();
+    const created: [BodyInfo, PhysX.PxArticulationLink][] = [];
+    const addLink = (body: BodyInfo, parent: PhysX.PxArticulationLink | null) => {
+      const pose = pxTransform(px, body.pose.position, body.pose.quaternion);
+      const link = art.createLink(parent as PhysX.PxArticulationLink, pose);
+      px.destroy(pose);
+      this.setUpBody(link, body);
+      this.applyDynamics(link, body);
+      created.push([body, link]);
+      return link;
+    };
+    const tree = new Map<BodyInfo, PhysX.PxArticulationLink>([[root, addLink(root, null)]]);
+    const joints: ArticulatedJoint[] = [];
+    for (const queue = [root]; queue.length; ) {
+      const parent = queue.shift()!;
+      for (const j of edges) {
+        if (used.has(j) || (j.body0 !== parent && j.body1 !== parent)) continue;
+        const sign = j.body0 === parent ? 1 : -1;
+        const child = sign > 0 ? j.body1! : j.body0!;
+        if (tree.has(child)) continue; // closes a loop: stays a maximal joint
+        const link = addLink(child, tree.get(parent)!);
+        tree.set(child, link);
+        used.add(j);
+        joints.push(this.configureArticulationJoint(link.getInboundJoint(), j, sign, tree.get(parent)!, link));
+        queue.push(child);
+      }
+    }
+
+    const Flag = px.PxArticulationFlagEnum;
+    if (anchor) art.setArticulationFlag(Flag.eFIX_BASE, true);
+    if (!info.selfCollision) art.setArticulationFlag(Flag.eDISABLE_SELF_COLLISION, true);
+    const settings = d.physxScene;
+    art.setSolverIterationCounts(clampCount(info.positionIterations, settings.positionIterations), clampCount(info.velocityIterations, settings.velocityIterations));
+    this.scene!.addArticulation(art);
+    this.articulations.push(art);
+    for (const [body, link] of created) {
+      links.set(body, link);
+      this.links.add(link);
+    }
+    for (const j of joints) if (hasAnimatedDrives(j.info)) this.articulatedJoints.push(j);
+  }
+
+  /** Joint type, frames, limits, drives and starting position of an articulation link's inbound joint. */
+  private configureArticulationJoint(
+    joint: PhysX.PxArticulationJointReducedCoordinate,
+    j: JointInfo,
+    sign: number,
+    parentLink: PhysX.PxArticulationLink,
+    childLink: PhysX.PxArticulationLink,
+  ): ArticulatedJoint {
+    const { px } = this;
+    const Type = px.PxArticulationJointTypeEnum;
+    const Axis = px.PxArticulationAxisEnum;
+    const Motion = px.PxArticulationMotionEnum;
+    const parentFrame = sign > 0 ? j.frame0 : j.frame1;
+    const childFrame = sign > 0 ? j.frame1 : j.frame0;
+    const pp = pxTransform(px, parentFrame.position, parentFrame.quaternion);
+    const cp = pxTransform(px, childFrame.position, childFrame.quaternion);
+    joint.setParentPose(pp);
+    joint.setChildPose(cp);
+    px.destroy(pp);
+    px.destroy(cp);
+
+    // The child joint frame in the parent joint frame at load time gives the starting joint position.
+    const frameOf = (link: PhysX.PxArticulationLink, f: Pose) => {
+      const t = link.getGlobalPose();
+      const q = new Quaternion(t.q.x, t.q.y, t.q.z, t.q.w);
+      const p = new Vector3(t.p.x, t.p.y, t.p.z);
+      return { position: f.position.clone().applyQuaternion(q).add(p), quaternion: q.multiply(f.quaternion) };
+    };
+    const pf = frameOf(parentLink, parentFrame);
+    const cf = frameOf(childLink, childFrame);
+    const inverse = pf.quaternion.clone().invert();
+    const relRotation = inverse.clone().multiply(cf.quaternion);
+    const relPosition = cf.position.clone().sub(pf.position).applyQuaternion(inverse);
+
+    // Reversed (body1 is the parent): the joint coordinate flips sign.
+    const range = (lower: number | undefined, upper: number | undefined) => (sign > 0 ? [lower, upper] : [upper === undefined ? undefined : -upper, lower === undefined ? undefined : -lower]);
+    const limit = (axis: number, lower: number | undefined, upper: number | undefined, angular: boolean) => {
+      const [lo, hi] = range(lower, upper);
+      if (!finite(lo) && !finite(hi)) {
+        joint.setMotion(axis, Motion.eFREE);
+        return;
+      }
+      const bound = angular ? Math.PI * 2 - 1e-3 : PX_MAX_F32;
+      const l = new px.PxArticulationLimit(finite(lo) ? Math.max(lo, -bound) : -bound, finite(hi) ? Math.min(hi, bound) : bound);
+      joint.setMotion(axis, Motion.eLIMITED);
+      joint.setLimitParams(axis, l);
+      px.destroy(l);
+    };
+    const axes: ArticulatedJoint["axes"] = [];
+    const drive = (name: keyof JointInfo["drives"], axis: number) => {
+      const dr = j.drives[name];
+      if (!dr) return;
+      const envelope = new px.PxPerformanceEnvelope(finite(dr.maxForce) ? dr.maxForce : PX_MAX_F32, PX_MAX_F32, 0, 0);
+      const DriveType = px.PxArticulationDriveTypeEnum;
+      const pd = new px.PxArticulationDrive(dr.stiffness, dr.damping, envelope, dr.type === "acceleration" ? DriveType.eACCELERATION : DriveType.eFORCE);
+      joint.setDriveParams(axis, pd);
+      px.destroy(pd);
+      px.destroy(envelope);
+      axes.push([name, axis]);
+    };
+    const twistAngle = () => 2 * Math.atan2(relRotation.x, relRotation.w);
+
+    switch (articulationJointKind(j)) {
+      case "fixed":
+        joint.setJointType(Type.eFIX);
+        break;
+      case "revolute": {
+        const limited = finite(j.lower) || finite(j.upper);
+        joint.setJointType(limited ? Type.eREVOLUTE : Type.eREVOLUTE_UNWRAPPED);
+        limit(Axis.eTWIST, j.lower, j.upper, true);
+        drive("angular", Axis.eTWIST);
+        joint.setJointPosition(Axis.eTWIST, twistAngle());
+        break;
+      }
+      case "prismatic": {
+        joint.setJointType(Type.ePRISMATIC);
+        if (j.type === "prismatic") {
+          limit(Axis.eX, j.lower, j.upper, false);
+          drive("linear", Axis.eX);
+          joint.setJointPosition(Axis.eX, relPosition.x);
+        } else {
+          const dof = (["transX", "transY", "transZ"] as const).find((n) => !j.dofLimits?.[n] || j.dofLimits[n]!.low <= j.dofLimits[n]!.high)!;
+          const axis = dof === "transX" ? Axis.eX : dof === "transY" ? Axis.eY : Axis.eZ;
+          limit(axis, j.dofLimits?.[dof]?.low, j.dofLimits?.[dof]?.high, false);
+          drive(dof, axis);
+          joint.setJointPosition(axis, relPosition.getComponent(dof === "transX" ? 0 : dof === "transY" ? 1 : 2));
+        }
+        break;
+      }
+      case "spherical": {
+        joint.setJointType(Type.eSPHERICAL);
+        if (j.type === "spherical") {
+          joint.setMotion(Axis.eTWIST, Motion.eFREE);
+          // cone0 swings toward the second axis (about Z), cone1 toward the third (about Y).
+          limit(Axis.eSWING1, finite(j.cone1) ? -j.cone1 : undefined, j.cone1, true);
+          limit(Axis.eSWING2, finite(j.cone0) ? -j.cone0 : undefined, j.cone0, true);
+        } else {
+          const map = [
+            ["rotX", Axis.eTWIST],
+            ["rotY", Axis.eSWING1],
+            ["rotZ", Axis.eSWING2],
+          ] as const;
+          for (const [dof, axis] of map) {
+            const lim = j.dofLimits?.[dof];
+            if (lim && lim.low > lim.high) joint.setMotion(axis, Motion.eLOCKED);
+            else limit(axis, lim?.low, lim?.high, true);
+            drive(dof, axis);
+          }
+        }
+        break;
+      }
+    }
+    for (const [name, axis] of axes) {
+      const { position, velocity } = driveTargetsAt(j.drives[name]!, 0);
+      joint.setDriveTarget(axis, sign * position);
+      joint.setDriveVelocity(axis, sign * velocity);
+    }
+    // PhysxJointAPI defaults (no friction, no armature, unbounded speed), not PhysX's own
+    // (friction 0.05, which holds a loaded robot joint still, and 100 rad/s).
+    joint.setFrictionCoefficient(j.physx.friction);
+    joint.setMaxJointVelocity(finite(j.physx.maxVelocity) ? j.physx.maxVelocity : 1e7);
+    if (j.physx.armature > 0) for (const axis of [Axis.eTWIST, Axis.eSWING1, Axis.eSWING2, Axis.eX, Axis.eY, Axis.eZ]) joint.setArmature(axis, j.physx.armature);
+    return { joint, info: j, sign, axes };
   }
 
   // ---------------------------------------------------------------- joints
@@ -548,6 +821,13 @@ export class PhysXEngine implements PhysicsEngine {
       const targets = d6DriveTargets(info, this.simTime + this.dt);
       if (targets) this.setDriveTargets(joint, targets);
     }
+    for (const { joint, info, sign, axes } of this.articulatedJoints) {
+      for (const [name, axis] of axes) {
+        const { position, velocity } = driveTargetsAt(info.drives[name]!, this.simTime + this.dt);
+        joint.setDriveTarget(axis, sign * position);
+        joint.setDriveVelocity(axis, sign * velocity);
+      }
+    }
     this.scene.simulate(this.dt);
     this.scene.fetchResults(true);
     this.simTime += this.dt;
@@ -597,9 +877,9 @@ export class PhysXEngine implements PhysicsEngine {
 
   setKinematicPose(index: number, position: Vector3, quaternion: Quaternion): void {
     const actor = this.actors[index];
-    if (!actor) return;
+    if (!actor || !this.held[index]) return;
     const t = pxTransform(this.px, position, quaternion);
-    actor.setKinematicTarget(t);
+    (actor as PhysX.PxRigidDynamic).setKinematicTarget(t);
     this.px.destroy(t);
   }
 
@@ -608,7 +888,7 @@ export class PhysXEngine implements PhysicsEngine {
   beginDrag(index: number, local: Vector3, target: Vector3): void {
     this.endDrag();
     const actor = this.actors[index];
-    if (!actor || this.description.bodies[index]?.kind !== "dynamic" || !this.scene) return;
+    if (!actor || this.held[index] || !this.scene) return;
     const { px, rt } = this;
     const pose = pxTransform(px, target, new Quaternion());
     const anchor = rt.physics.createRigidDynamic(pose);
@@ -626,7 +906,8 @@ export class PhysXEngine implements PhysicsEngine {
     const drive = new px.PxD6JointDrive(DRAG_STIFFNESS, DRAG_DAMPING, PX_MAX_F32, true);
     for (const axis of [px.PxD6DriveEnum.eX, px.PxD6DriveEnum.eY, px.PxD6DriveEnum.eZ]) joint.setDrive(axis, drive);
     px.destroy(drive);
-    actor.wakeUp();
+    if (this.links.has(actor)) (actor as PhysX.PxArticulationLink).getArticulation().wakeUp();
+    else (actor as PhysX.PxRigidDynamic).wakeUp();
     this.drag = { anchor, joint };
   }
 
@@ -655,8 +936,11 @@ export class PhysXEngine implements PhysicsEngine {
   private teardown(): void {
     this.endDrag();
     this.animatedDrives = [];
+    this.articulatedJoints = [];
     for (const joint of this.joints.splice(0)) joint.release();
-    for (const actor of this.actors.splice(0)) actor.release();
+    for (const actor of this.actors.splice(0)) if (!this.links.has(actor)) actor.release();
+    for (const art of this.articulations.splice(0)) art.release();
+    this.links.clear();
     for (const actor of this.statics.splice(0)) actor.release();
     this.staticByCollider.clear();
     this.scene?.release();
