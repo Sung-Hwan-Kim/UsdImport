@@ -5,7 +5,7 @@ import { isUrl, joinPath, relativePath } from "./paths";
 
 export type { USDLayerData, USDSpec };
 
-export const SpecType = { Attribute: 1, Prim: 6, Relationship: 8 } as const;
+export const SpecType = { Attribute: 1, Prim: 6, Relationship: 8, Variant: 10, VariantSet: 11 } as const;
 const Specifier = { Def: 0, Over: 1, Class: 2 } as const;
 
 export type FileKind = "usda" | "usdc" | "usdz" | "unknown";
@@ -47,8 +47,9 @@ export function parseLayer(path: string, bytes: Uint8Array): ParsedLayer {
     throw new Error("USD 파일 형식을 인식할 수 없습니다 (#usda 헤더 또는 PXR-USDC 시그니처 없음).");
   }
   const header = readUsdaHeader(text);
-  const data = new USDAParser().parseData(normalizeUsdaText(text));
-  postProcessUsda(data);
+  const variants: VariantName[] = [];
+  const data = new USDAParser().parseData(normalizeUsdaText(text, variants));
+  postProcessUsda(data, variants);
   Object.assign(data.specsByPath["/"].fields, pickHeaderFields(header.metadata));
   return { path, format: "usda", byteLength: bytes.byteLength, data, subLayers: header.subLayers, metadata: header.metadata };
 }
@@ -58,18 +59,29 @@ export function parseLayer(path: string, bytes: Uint8Array): ParsedLayer {
 const OVER_MARK = "__viewerOver";
 const CLASS_MARK = "__viewerClass";
 const INACTIVE_ATTR = "__viewerInactive";
+const VARIANT_MARK = "__viewerVariant";
+
+/** A variant set and variant name, by the index in its marker prim's name. */
+type VariantName = [set: string, variant: string];
+
+/** `rel x` or `type x.connect =` after a list-op keyword. */
+const LISTED_PROPERTY = String.raw`(?:(?:custom|uniform|varying)\s+)*(?:rel\s|[\w[\]]+\s+[\w:.]+\.connect\s*=)`;
 
 /**
  * Rewrites USDA syntax the three parser ignores into forms it reads:
- * plain/append `references` and `apiSchemas`, list-edited `payload`, `over`
- * and `class` prims, and `active = false`. The markers are resolved again in
- * postProcessUsda().
+ * plain/append `references` and `apiSchemas`, list-edited `payload`,
+ * relationships and connections, `over` and `class` prims, variant sets and
+ * `active = false`. The markers are resolved again in postProcessUsda().
  */
-function normalizeUsdaText(text: string): string {
-  return text
+function normalizeUsdaText(text: string, variants: VariantName[]): string {
+  return markVariantSets(dropValuelessPropertyMetadata(text), variants)
     .replace(/^(\s*)(?:add\s+|append\s+)?references(\s*=)/gm, "$1prepend references$2")
     .replace(/^(\s*)(?:add\s+|append\s+)?apiSchemas(\s*=)/gm, "$1prepend apiSchemas$2")
     .replace(/^(\s*)(?:prepend|append|add)\s+payload(\s*=)/gm, "$1payload$2")
+    .replace(new RegExp(String.raw`^(\s*)(?:prepend|append|add)\s+(?=${LISTED_PROPERTY})`, "gm"), "$1")
+    .replace(new RegExp(String.raw`^\s*(?:delete|reorder)\s+${LISTED_PROPERTY}.*$`, "gm"), "")
+    // Variant set names come from the variantSet blocks; three would read this as an attribute.
+    .replace(/^\s*(?:(?:prepend|append|add|delete|reorder)\s+)?variantSets\s*=.*$/gm, "")
     .replace(/^(\s*)over\s+(?:(\w+)\s+)?"/gm, (_m, ws: string, type?: string) => `${ws}def ${type ?? ""}${OVER_MARK} "`)
     .replace(/^(\s*)class\s+(?:(\w+)\s+)?"/gm, (_m, ws: string, type?: string) => `${ws}def ${type ?? ""}${CLASS_MARK} "`)
     .replace(/^(\s*)active\s*=\s*false\s*$/gm, `$1bool ${INACTIVE_ATTR} = 1`)
@@ -77,10 +89,200 @@ function normalizeUsdaText(text: string): string {
     .replace(/^(\s*)custom\s+(?=\S)/gm, "$1");
 }
 
-function postProcessUsda(data: USDLayerData): void {
+/** Open quote and brace state while scanning USDA lines. */
+interface ScanState {
+  quote: string;
+  /** One entry per open `{`: the variant set it opens, else null. */
+  braces: (string | null)[];
+}
+
+/** Track the braces of a line outside strings, `<paths>` and `@assets@`. */
+function scanBraces(line: string, state: ScanState): void {
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (state.quote) {
+      if (ch === "\\") i++;
+      else if (line.startsWith(state.quote, i)) {
+        i += state.quote.length - 1;
+        state.quote = "";
+      }
+    } else if (ch === '"' || ch === "'") {
+      state.quote = line.startsWith(ch.repeat(3), i) ? ch.repeat(3) : ch;
+      i += state.quote.length - 1;
+    } else if (ch === "<" || ch === "@") {
+      const end = line.indexOf(ch === "<" ? ">" : "@", i + 1);
+      if (end > i) i = end;
+    } else if (ch === "{") {
+      state.braces.push(null);
+    } else if (ch === "}") {
+      state.braces.pop();
+    }
+  }
+  // Only triple-quoted strings span lines.
+  if (state.quote.length === 1) state.quote = "";
+}
+
+/**
+ * three's parser cannot read `variantSet "name" = { "variant" (...) { ... } }`
+ * blocks. Turn each variant into a marked child prim (`def "__viewerVariant3"`)
+ * that it does read, with the variant's metadata (payload, references) and
+ * contents; postProcessUsda() moves them to `/prim/{set=variant}` specs the
+ * way crate files store them.
+ */
+function markVariantSets(text: string, variants: VariantName[]): string {
+  if (!/^[ \t]*variantSet[ \t]/m.test(text)) return text;
+  const state: ScanState = { quote: "", braces: [] };
+  const out: string[] = [];
+  let metadataOpen = false;
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    const indent = line.slice(0, line.length - line.trimStart().length);
+    if (!state.quote) {
+      const set = state.braces.at(-1) ?? null;
+      const header = /^variantSet\s+"([^"]+)"\s*=\s*\{$/.exec(t);
+      if (header) {
+        state.braces.push(header[1]);
+        continue;
+      }
+      if (set !== null) {
+        if (t === "}") {
+          state.braces.pop();
+          continue;
+        }
+        const variant = /^"([^"]*)"\s*([({])\s*(\})?$/.exec(t);
+        if (variant) {
+          const def = `${indent}def "${VARIANT_MARK}${variants.push([set, variant[1]]) - 1}"`;
+          if (variant[2] === "(") {
+            out.push(`${def} (`);
+            metadataOpen = true;
+          } else {
+            out.push(def, `${indent}{`);
+            if (variant[3]) out.push(`${indent}}`);
+            else state.braces.push(null);
+          }
+          continue;
+        }
+      }
+      // The variant's metadata closes on the line that opens its body: `) {`.
+      if (metadataOpen && /^\)\s*\{\s*(\})?$/.test(t)) {
+        out.push(`${indent})`, `${indent}{`);
+        if (t.endsWith("}")) out.push(`${indent}}`);
+        else state.braces.push(null);
+        metadataOpen = false;
+        continue;
+      }
+    }
+    scanBraces(line, state);
+    out.push(line);
+  }
+  return out.join("\n");
+}
+
+/** A property declared without a value, opening its metadata: `token outputs:surface (`. */
+const VALUELESS_PROPERTY = /^[ \t]*(?:[\w[\]]+[ \t]+)+[\w:.]+[ \t]*\(/gm;
+
+/**
+ * three reads `token outputs:surface (` (metadata but no value, as Omniverse
+ * writes material outputs) as a time sample and then takes its `)` for the end
+ * of the enclosing prim, shifting every later prim up the hierarchy. Such
+ * metadata (displayGroup, doc, ...) means nothing to the viewer, so keep only
+ * the declaration.
+ */
+function dropValuelessPropertyMetadata(text: string): string {
+  VALUELESS_PROPERTY.lastIndex = 0;
+  if (!VALUELESS_PROPERTY.test(text)) return text;
+  const lines = text.split("\n");
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    VALUELESS_PROPERTY.lastIndex = 0;
+    const match = VALUELESS_PROPERTY.exec(lines[i]);
+    const end = match ? closingParenLine(lines, i, match[0].length - 1) : null;
+    if (end === null) {
+      out.push(lines[i]);
+      continue;
+    }
+    out.push(match![0].slice(0, -1).trimEnd());
+    i = end;
+  }
+  return out.join("\n");
+}
+
+/** The line holding the `)` that closes the `(` at lines[line][col], skipping strings. */
+function closingParenLine(lines: string[], line: number, col: number): number | null {
+  let depth = 0;
+  let quote = "";
+  for (let i = line; i < lines.length; i++) {
+    const s = lines[i];
+    for (let j = i === line ? col : 0; j < s.length; j++) {
+      const ch = s[j];
+      if (quote) {
+        if (ch === "\\") j++;
+        else if (s.startsWith(quote, j)) {
+          j += quote.length - 1;
+          quote = "";
+        }
+      } else if (ch === '"' || ch === "'") {
+        quote = s.startsWith(ch.repeat(3), j) ? ch.repeat(3) : ch;
+        j += quote.length - 1;
+      } else if (ch === "(") {
+        depth++;
+      } else if (ch === ")" && --depth === 0) {
+        return i;
+      }
+    }
+    // Only triple-quoted strings span lines.
+    if (quote.length === 1) quote = "";
+  }
+  return null;
+}
+
+/**
+ * Move the marked variant prims to variant specs (`/prim/{set=variant}`, as
+ * crate files store them), with a `/prim/{set=}` spec listing each set's
+ * variants and the set on the prim's `variantSetChildren`.
+ */
+function unmarkVariants(data: USDLayerData, variants: VariantName[]): void {
+  if (!variants.length) return;
+  const marked = new RegExp(String.raw`/${VARIANT_MARK}(\d+)(?=[/.]|$)`, "g");
+  const variantSpec = new RegExp(String.raw`/${VARIANT_MARK}(\d+)$`);
+  const original = data.specsByPath;
+  const specs: Record<string, USDSpec> = {};
+  for (const path in original) {
+    const spec = original[path];
+    const renamed = path.replace(marked, (_m, i: string) => `/{${variants[+i][0]}=${variants[+i][1]}}`);
+    specs[renamed] = spec;
+    const own = variantSpec.exec(path);
+    if (!own) continue;
+    const [set, name] = variants[+own[1]];
+    spec.specType = SpecType.Variant;
+    delete spec.fields.typeName;
+    delete spec.fields.specifier;
+    const owner = renamed.slice(0, renamed.lastIndexOf("/{")) || "/";
+    const setSpec = (specs[`${owner}/{${set}=}`] ??= { specType: SpecType.VariantSet, fields: { variantChildren: [] } });
+    (setSpec.fields.variantChildren as string[]).push(name);
+    const ownerFields = original[path.slice(0, own.index) || "/"]?.fields;
+    if (!ownerFields) continue;
+    if (Array.isArray(ownerFields.primChildren)) {
+      ownerFields.primChildren = (ownerFields.primChildren as string[]).filter((c) => c !== `${VARIANT_MARK}${own[1]}`);
+    }
+    const sets = (ownerFields.variantSetChildren as string[] | undefined) ?? [];
+    if (!sets.includes(set)) ownerFields.variantSetChildren = [...sets, set];
+  }
+  data.specsByPath = specs;
+}
+
+function postProcessUsda(data: USDLayerData, variants: VariantName[]): void {
+  unmarkVariants(data, variants);
   const specs = data.specsByPath;
   for (const path in specs) {
     const spec = specs[path];
+    // three keeps xformOpOrder as a prim field; store it as the attribute it is
+    // (as crate files do) so opinions from usda and usdc layers compose per attribute.
+    const order = spec.fields.xformOpOrder;
+    if (Array.isArray(order)) {
+      specs[`${path}.xformOpOrder`] ??= { specType: SpecType.Attribute, fields: { typeName: "token[]", default: order } };
+      delete spec.fields.xformOpOrder;
+    }
     if (spec.specType === SpecType.Prim && path !== "/") {
       // Sdf's fallback specifier is `over`, so record `def` explicitly like crate files do.
       const typeName = spec.fields.typeName;
@@ -186,7 +388,7 @@ export function collectAssetPaths(layer: ParsedLayer): string[] {
   return [...out];
 }
 
-function mapAssetStrings(value: unknown, fn: (p: string) => string, depth = 0): unknown {
+export function mapAssetStrings(value: unknown, fn: (p: string) => string, depth = 0): unknown {
   if (depth > 8 || value == null) return value;
   if (typeof value === "string") {
     if (value.includes("@")) return value.replace(/@([^@\n]+)@/g, (_m, p: string) => `@${fn(p)}@`);
@@ -210,7 +412,7 @@ function mapAssetStrings(value: unknown, fn: (p: string) => string, depth = 0): 
 const VALUE_FIELDS = new Set(["default", "timeSamples"]);
 
 /** Merge `weak` opinions into `strong` (both specsByPath maps); strong wins per field. */
-function mergeWeaker(strong: Record<string, USDSpec>, weak: Record<string, USDSpec>): void {
+export function mergeWeaker(strong: Record<string, USDSpec>, weak: Record<string, USDSpec>): void {
   for (const path in weak) {
     const w = weak[path];
     const s = strong[path];
@@ -240,7 +442,7 @@ function mergeWeaker(strong: Record<string, USDSpec>, weak: Record<string, USDSp
   }
 }
 
-function cloneSpecs(specs: Record<string, USDSpec>, rebase?: (p: string) => string): Record<string, USDSpec> {
+export function cloneSpecs(specs: Record<string, USDSpec>, rebase?: (p: string) => string): Record<string, USDSpec> {
   const out: Record<string, USDSpec> = {};
   for (const path in specs) {
     const spec = specs[path];
@@ -252,14 +454,14 @@ function cloneSpecs(specs: Record<string, USDSpec>, rebase?: (p: string) => stri
   return out;
 }
 
-function parentPathOf(path: string): string {
+export function parentPathOf(path: string): string {
   if (path.endsWith("}")) return path.slice(0, path.lastIndexOf("{")).replace(/\/$/, "") || "/";
   const cut = Math.max(path.lastIndexOf("/"), path.lastIndexOf("}"));
   if (cut <= 0) return "/";
   return path.slice(0, cut + (path[cut] === "}" ? 1 : 0));
 }
 
-function primPartOf(path: string): string {
+export function primPartOf(path: string): string {
   const lastSlash = path.lastIndexOf("/");
   const dot = path.indexOf(".", Math.max(lastSlash, path.lastIndexOf("}")));
   return dot >= 0 ? path.slice(0, dot) : path;
@@ -268,7 +470,7 @@ function primPartOf(path: string): string {
 // ---------------------------------------------------------------- internal references
 
 /** A path equal to `root` or inside its namespace (children, properties, variants). */
-function isUnder(path: string, root: string): boolean {
+export function isUnder(path: string, root: string): boolean {
   return path === root || (path.startsWith(root) && "/.{".includes(path[root.length]));
 }
 
@@ -340,7 +542,7 @@ function composeInternalReferences(specs: Record<string, USDSpec>): void {
 }
 
 /** Drop prims USD would not draw: inactive, or never `def`ined (over/class only). */
-function pruneUndefinedPrims(specs: Record<string, USDSpec>): number {
+export function pruneUndefinedPrims(specs: Record<string, USDSpec>): number {
   const dead = new Set<string>();
   for (const path in specs) {
     const spec = specs[path];
@@ -374,9 +576,10 @@ export interface StackResult {
 }
 
 /**
- * Flatten a layer with its (recursive) subLayers into one specsByPath map so
- * the composer sees a single layer. Asset paths authored in sublayers living
- * in other folders are rebased onto the stack's root folder.
+ * Flatten a layer with its (recursive) subLayers into one specsByPath map.
+ * Asset paths authored in sublayers living in other folders are rebased onto
+ * the stack's root folder. Nothing is pruned: `over`s may be about prims that
+ * references bring in, which flattenStage() (arcs.ts) composes.
  */
 export function flattenLayerStack(
   rootPath: string,
@@ -406,6 +609,5 @@ export function flattenLayerStack(
   const specs = flatten(rootPath, new Set([rootPath]));
   if (specs["/"]) delete specs["/"].fields.subLayers;
   composeInternalReferences(specs);
-  pruneUndefinedPrims(specs);
   return { data: { specsByPath: specs }, sublayers: used };
 }

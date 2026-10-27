@@ -217,7 +217,7 @@ const DEFORMABLE_SIM_APIS: Record<string, DeformableKind> = {
 
 // ---------------------------------------------------------------- spec access
 
-/** Reads authored opinions for an object, following `tag.source` for referenced prims. */
+/** Reads an object's composed opinions (the root layer holds the flattened stage). */
 class SpecReader {
   constructor(private readonly stage: LoadedStage) {}
 
@@ -227,8 +227,7 @@ class SpecReader {
 
   private tags(obj: Object3D): PrimTag[] {
     const tag = getPrimTag(obj);
-    if (!tag) return [];
-    return tag.source ? [tag, tag.source] : [tag];
+    return tag ? [tag] : [];
   }
 
   apis(obj: Object3D): string[] {
@@ -430,17 +429,12 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
     return times.length ? { times, values } : undefined;
   };
 
-  // Index objects for relationship targets: per composition instance, and by stage path.
-  const byInstance = new Map<string, Object3D>();
+  // Relationship targets are stage paths (references are flattened with their targets re-rooted).
   const byStagePath = new Map<string, Object3D>();
   root.traverse((obj) => {
-    const tag = getPrimTag(obj);
-    if (!tag || obj.userData.internal) return;
-    byInstance.set(`${tag.instance}|${tag.path}`, obj);
-    if (tag.source) byInstance.set(`${tag.source.instance}|${tag.source.path}`, obj);
-    byStagePath.set(stagePathOf(obj), obj);
+    if (getPrimTag(obj) && !obj.userData.internal) byStagePath.set(stagePathOf(obj), obj);
   });
-  const resolveTarget = (tag: PrimTag, path: string) => byInstance.get(`${tag.instance}|${path}`) ?? byStagePath.get(path) ?? null;
+  const resolveTarget = (path: string) => byStagePath.get(path) ?? null;
   /** An authored finite number, scaled; undefined when unauthored (PhysX keeps its default). */
   const authoredNumber = (obj: Object3D, name: string, scale = 1) => {
     const v = reader.num(obj, name, Number.NaN);
@@ -593,7 +587,7 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
     }
     const body = owningBody(obj);
     const pose = worldPose(obj);
-    const typeName = getPrimTag(obj)?.source?.typeName || getPrimTag(obj)?.typeName || "Mesh";
+    const typeName = getPrimTag(obj)?.typeName || "Mesh";
     const authored = reader.token(obj, "physics:approximation") ?? "none";
     const collider: ColliderInfo = {
       object: obj,
@@ -675,7 +669,7 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
     group.invert ||= reader.bool(obj, "physics:invertFilteredGroups", false);
     const filtered = reader.rel(obj, "physics:filteredGroups");
     for (const path of filtered?.targets ?? []) {
-      const index = groupIndex.get(resolveTarget(filtered!.tag, path) ?? root);
+      const index = groupIndex.get(resolveTarget(path) ?? root);
       if (index !== undefined && !group.filtered.includes(index)) group.filtered.push(index);
     }
     // collection:colliders — the nearest included or excluded ancestor decides (expandPrims).
@@ -683,7 +677,7 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
     for (const [name, included] of [["includes", true], ["excludes", false]] as const) {
       const rel = reader.rel(obj, `collection:colliders:${name}`);
       for (const path of rel?.targets ?? []) {
-        const target = resolveTarget(rel!.tag, path);
+        const target = resolveTarget(path);
         if (target) rule.set(target, included);
       }
     }
@@ -716,7 +710,7 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
     const rel = reader.rel(obj, "physics:filteredPairs");
     const own = rel ? collidersOf(obj) : [];
     for (const path of rel?.targets ?? []) {
-      const target = resolveTarget(rel!.tag, path);
+      const target = resolveTarget(path);
       const other = target ? collidersOf(target) : [];
       if (own.length && other.length) filteredPairs.push([own, other]);
     }
@@ -749,7 +743,7 @@ export function extractPhysics(stage: LoadedStage): PhysicsDescription {
       let body: BodyInfo | null = null;
       let staticCollider: ColliderInfo | null = null;
       if (rel) {
-        const target = resolveTarget(rel.tag, rel.targets[0]);
+        const target = resolveTarget(rel.targets[0]);
         if (!target) {
           warnings.push(`${path}: body${n} 대상 ${rel.targets[0]}을(를) 찾을 수 없습니다.`);
           return null;

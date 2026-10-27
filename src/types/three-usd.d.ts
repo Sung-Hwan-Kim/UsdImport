@@ -78,16 +78,11 @@ declare module "three/examples/jsm/loaders/usd/USDComposer.js" {
     applyTransform(obj: Object3D, fields: Record<string, unknown>, attrs?: Record<string, unknown>): void;
     protected _buildHierarchy(parent: Object3D, parentPath: string): void;
     protected _buildMesh(path: string, spec: USDSpec): Mesh;
-    protected _resolveReference(refValue: string, localVariants?: Record<string, string>): Group | null;
     protected _resolveFilePath(refPath: string): string;
-    protected _getReferences(spec: USDSpec): string[];
-    protected _getVariantPaths(parentPath: string): string[];
     protected _getAttributes(path: string): Record<string, unknown>;
     protected _collectAttributesFromPath(path: string, attrs: Record<string, unknown>): void;
     protected _buildTransformAnimations(): unknown[];
     protected _getGeomSubsets(meshPath: string): { name: string; indices: ArrayLike<number>; materialPath: string | null }[];
-    protected _findSingleMesh(group: Object3D): Mesh | null;
-    protected _hasNonIdentityTransform(obj: Object3D): boolean;
     protected _loadTexture(filePath: string, textureAttrs: unknown, transformAttrs: unknown): Texture | null;
     protected _applyMaterial(material: Material, materialPath: string): void;
     protected _getMaterialPath(meshPath: string, fields: Record<string, unknown>): string | null;

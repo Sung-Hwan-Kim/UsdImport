@@ -1,5 +1,6 @@
 import type { AnimationClip, Group, Material, Mesh, Object3D, SkinnedMesh, Texture } from "three";
 import { unzipSync } from "three/examples/jsm/libs/fflate.module.js";
+import { flattenStage } from "./arcs";
 import { adaptLightUnits, transformAnimation, ViewerComposer, type ComposeContext, type PrimTag } from "./composer";
 import {
   SpecType,
@@ -23,7 +24,7 @@ export interface LayerInfo {
   format: LayerFormat;
   byteLength: number;
   role: LayerRole;
-  /** Flattened layer stack, as handed to the composer. */
+  /** The layer with its sublayers merged; for the root, the whole stage flattened as handed to the composer. */
   data: USDLayerData;
   metadata: Record<string, unknown>;
 }
@@ -199,13 +200,16 @@ export async function loadStage(source: AssetSource, requestedRoot: string, opti
     const stack = flattenLayerStack(path, layers, resolveExisting);
     for (const s of stack.sublayers) sublayerPaths.add(s);
     stacks.set(path, stack.data);
-    assets[path] = stack.data;
-    index.add(path);
   }
   for (const [path, bytes] of images) {
     assets[path] = bytes;
     index.add(path);
   }
+
+  progress("참조 합성 중…");
+  await nextFrame();
+  const flat = flattenStage(rootPath, { stacks, resolve: resolveDependency, missing, warnings });
+  const rootData = flat.data;
 
   const layerInfos = new Map<string, LayerInfo>();
   for (const [path, layer] of layers) {
@@ -214,7 +218,7 @@ export async function loadStage(source: AssetSource, requestedRoot: string, opti
       format: layer.format,
       byteLength: layer.byteLength,
       role: path === rootPath ? "root" : sublayerPaths.has(path) ? "sublayer" : "reference",
-      data: stacks.get(path)!,
+      data: path === rootPath ? rootData : stacks.get(path)!,
       metadata: layer.metadata,
     });
   }
@@ -224,32 +228,27 @@ export async function loadStage(source: AssetSource, requestedRoot: string, opti
   const tCompose = performance.now();
   const ctx: ComposeContext = {
     resolveAsset: (p) => index.resolve(p),
-    textureCaches: new Map(),
-    texturePromises: [],
-    animations: [],
+    origins: flat.origins,
     animatedXforms: new Map(),
     missing,
     warnings,
-    referenceCount: 0,
-    instanceCount: 0,
   };
-  const rootData = stacks.get(rootPath)!;
-  const composer = new ViewerComposer(ctx, rootPath, [rootPath]);
+  const composer = new ViewerComposer(ctx, rootPath);
   const scene = composer.compose(rootData, createAssetMap(assets, index), {}, dirname(rootPath));
   scene.name = name;
-  scene.userData.usd = { layer: rootPath, path: "/", instance: 0, typeName: "Stage" } satisfies PrimTag;
+  scene.userData.usd = { layer: rootPath, path: "/", typeName: "Stage" } satisfies PrimTag;
   applyResetXformStacks(scene);
   adaptLightUnits(scene, warnings);
   const transforms = transformAnimation(scene, ctx);
-  scene.animations = [...scene.animations, ...ctx.animations, ...(transforms ? [transforms] : [])];
+  if (transforms) scene.animations = [...scene.animations, transforms];
   // Authored visibility, so saving can tell which prims the viewer showed or hid.
   scene.traverse((obj) => (obj.userData.loadedVisible = obj.visible));
   const composeTime = performance.now() - tCompose;
 
   const tTextures = performance.now();
-  if (ctx.texturePromises.length) {
-    progress(`텍스처 ${ctx.texturePromises.length}개 디코딩 중…`);
-    await Promise.all(ctx.texturePromises);
+  if (composer.texturePromises.length) {
+    progress(`텍스처 ${composer.texturePromises.length}개 디코딩 중…`);
+    await Promise.all(composer.texturePromises);
   }
   const textureTime = performance.now() - tTextures;
 
@@ -264,7 +263,7 @@ export async function loadStage(source: AssetSource, requestedRoot: string, opti
     endTimeCode: num(rootFields.endTimeCode),
     timeCodesPerSecond: num(rootFields.timeCodesPerSecond) ?? num(rootFields.framesPerSecond) ?? 24,
     documentation: typeof rootFields.documentation === "string" && rootFields.documentation ? rootFields.documentation : undefined,
-    hasPhysics: [...stacks.values()].some(hasPhysicsSpecs),
+    hasPhysics: hasPhysicsSpecs(rootData),
   };
 
   let prims = 0;
@@ -285,7 +284,7 @@ export async function loadStage(source: AssetSource, requestedRoot: string, opti
     missing: [...missing].sort(),
     warnings: [...warnings],
     metadata,
-    stats: { ...computeStats(scene), prims, references: ctx.referenceCount },
+    stats: { ...computeStats(scene), prims, references: flat.arcs },
     timings: { parse: parseTime, compose: composeTime, textures: textureTime, total: performance.now() - t0 },
   };
 }

@@ -113,7 +113,8 @@ Isaac Sim에서 직접 실행할 수도 있습니다(Standalone은 `python.sh` /
 ## 지원 기능
 
 - USDA(ASCII), USDC(Crate 바이너리), USD(둘 중 하나), USDZ(패키지)
-- 합성(Composition): `references`(defaultPrim / 프림 지정, 같은 파일 안의 `</Path>` 내부 참조 포함), `payload`, `subLayers`(스택 병합, `over` 오버라이드), USDC `variantSets`
+- 합성(Composition): `references`(defaultPrim / 프림 지정, 같은 파일 안의 `</Path>` 내부 참조 포함), `payload`, `subLayers`(스택 병합),
+  `variantSets`(USDA · USDC, 배리언트 안의 참조 · payload 포함), 참조로 들어온 프림 위에 덮어쓴 `over`(바인딩 · purpose · API 스키마 · 값)
 - `active = false`, `visibility = invisible`, `purpose = guide`, 그리고 `over`나 `class`로만 존재하는 프림은 USD와 같이 렌더링에서 제외
 - UsdGeom Mesh / Cube / Sphere / Cylinder / Cone / Capsule, GeomSubset 멀티 머티리얼
 - UsdPreviewSurface / OpenPBR 머티리얼과 텍스처(PNG/JPG/WebP/AVIF), 머티리얼이 없는 프림의 `displayColor`·`displayOpacity`(Cube·Sphere 등 포함)
@@ -129,10 +130,11 @@ Isaac Sim에서 직접 실행할 수도 있습니다(Standalone은 `python.sh` /
 
 ```
 src/lib/usd/
-  loadStage.ts    로딩 파이프라인: 읽기 → 의존성 BFS → 레이어 스택 병합 → 합성 → 텍스처
-  layers.ts       형식 감지, USDA 전처리, 의존성 추출, subLayer 병합 및 프림 정리
+  loadStage.ts    로딩 파이프라인: 읽기 → 의존성 BFS → 레이어 스택 병합 → 참조 · 배리언트 펼치기 → 씬 그래프 → 텍스처
+  layers.ts       형식 감지, USDA 전처리(배리언트 · 목록 편집 포함), 의존성 추출, subLayer 병합 및 프림 정리
+  arcs.ts         references · payload · variant를 스펙 단위로 펼쳐 한 레이어로 합성 (OpenUSD의 Flatten과 같은 방식)
   crateParser.ts  USDCParser 확장 (three가 처리하지 못하는 Crate 값 타입과 버그)
-  composer.ts     USDComposer 확장 (프림 태깅, 참조 의미론, 서브셋, 라이트)
+  composer.ts     USDComposer 확장 (프림 태깅, xformOp 평가, 서브셋, 라이트)
   sources.ts      로컬 파일 / 메모리 내 USDZ / HTTP 에셋 소스
 src/lib/physics/
   schema.ts       UsdPhysics → 시뮬레이션 기술(바디·콜라이더·머티리얼·조인트·중력, 미터·Y-up 기준)
@@ -150,8 +152,15 @@ scripts/generate_samples.py   public/samples 생성 스크립트 (`pip install u
 
 - Crate: `ReferenceListOp` · `Payload(ListOp)` · `StringVector`(subLayers) · `TokenListOp` 디코딩,
   인라인된 `Vec3d`/`Vec3h` 값, 경로 개수와 인코딩된 경로 개수가 다른 경로 테이블 처리
-- 합성: subLayer 스택, defaultPrim/프림 지정 references, 중첩 참조의 텍스처·애니메이션 전달,
-  GeomSubset에 속하지 않은 면, 바인딩되지 않은 메시, UsdLux 라이트의 방향과 exposure
+- 합성: three는 참조마다 대상 레이어 전체를 따로 합성해서, 참조하는 쪽의 `over` · 관계 · 배리언트가 대상 프림에 닿지 않고
+  여러 부품이 한 레이어를 참조하는 에셋(Isaac Sim / MuJoCo 변환기의 `instances.usda` → `geometries.usd`)은 작업량이 제곱으로 늘어
+  열리지 않았습니다. 그래서 `arcs.ts`가 OpenUSD처럼 먼저 펼칩니다: 레이어 스택마다 배리언트를 선택하고(배리언트 안의 arc는
+  프림 자신의 참조보다 강함), 참조 · payload 대상의 스펙을 참조하는 프림 아래로 복사해 약한 의견으로 합칩니다. 대상 안을 가리키는
+  관계 · 연결 경로는 옮기고 대상 밖을 가리키면 OpenUSD처럼 버리며, 다른 폴더의 에셋 경로는 다시 계산합니다. 참조된 레이어는
+  배리언트 선택별로 한 번만 합성해 참조마다 복사하고, 정의되지 않은 프림은 마지막에 정리합니다
+- 씬 그래프: GeomSubset에 속하지 않은 면, 바인딩되지 않은 메시, UsdLux 라이트의 방향과 exposure
+- USDA: three의 파서는 `variantSet` 블록, `prepend rel` · `prepend … .connect` 같은 목록 편집, 값 없이 메타데이터만 있는
+  속성 선언(`token outputs:surface ( … )`, Omniverse 머티리얼)을 읽지 못하거나 프림 계층을 어긋나게 읽으므로 전처리에서 바꿔 줍니다
 - 내부 참조: three는 에셋 경로 없는 `</Path>` 참조를 무시하므로, 레이어 스택을 합칠 때 대상 프림의 스펙을 참조하는 프림 아래로
   복사해 약한 의견으로 합성합니다(대상 안을 가리키는 관계·연결 경로도 옮김). 대상은 보통 그려지지 않는 `class` 프림 아래에
   있어서 정리 전에 합성하며, USDA의 `class` 블록도 읽도록 보완했습니다
@@ -164,8 +173,8 @@ scripts/generate_samples.py   public/samples 생성 스크립트 (`pip install u
 
 ## 알려진 제한 사항
 
-- 표시: USDA의 `variantSet` 블록, `inherits` / `specializes`, 같은 파일 안의 내부 payload는 지원하지 않습니다
-  (저장은 이것들을 모두 그대로 유지합니다)
+- 표시: `inherits` / `specializes`는 지원하지 않습니다(저장은 그대로 유지합니다). 참조하는 프림의 배리언트 선택은
+  참조된 레이어 안의 같은 이름 배리언트 세트 전체에 적용합니다
 - DomeLight(HDR 환경 조명), PointInstancer, BasisCurves / Points, UDIM, EXR/TIFF 텍스처는 지원하지 않습니다
 - 큰 파일은 메인 스레드에서 파싱하므로 로딩 중 UI가 잠깐 멈출 수 있습니다
 - 물리: 아티큘레이션(ArticulationRootAPI)은 일반 조인트로 시뮬레이션합니다. convexDecomposition은 PhysX에서 단일 볼록 껍질로 근사하며,
