@@ -5,10 +5,10 @@
   "scripts": {
     "postinstall": "node scripts/copy-physx-wasm.mjs",
     "predev": "node scripts/copy-physx-wasm.mjs",
-    "dev": "next dev",
+    "dev": "next dev -p 3300",
     "prebuild": "node scripts/copy-physx-wasm.mjs",
     "build": "next build",
-    "start": "next start",
+    "start": "next start -p 3300",
     "newton:setup": "node scripts/newton.mjs setup",
     "newton": "node scripts/newton.mjs serve",
     "lint": "eslint"

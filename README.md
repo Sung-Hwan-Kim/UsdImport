@@ -7,7 +7,7 @@ UsdPhysics가 작성된 스테이지는 **PhysX**(브라우저 WASM) 또는 **NV
 
 ```bash
 npm install
-npm run dev        # http://localhost:3000
+npm run dev        # http://localhost:3300
 npm run build && npm start
 ```
 
